@@ -1,4 +1,4 @@
-//! Vulkan renderer skeleton.
+//! Vulkan renderer.
 //!
 //! Responsibilities at this stage:
 //!
@@ -9,22 +9,70 @@
 //!   per frame sync primitives.
 //! * Re-create the swapchain when the window is resized or when the
 //!   driver reports the chain is out of date / suboptimal.
+//! * Own a single graphics pipeline (`crate::pipeline`) plus one host
+//!   visible vertex buffer per frame in flight (`crate::buffer`).
 //! * Issue one render pass per frame that clears the full surface to
-//!   a background color and then clears a centered square sub-region
-//!   to a different color, so the user can see immediately whether
-//!   the chosen aspect ratio gives a sensible playfield.
+//!   the letterbox color and then draws the per frame vertex list
+//!   inside a centered square viewport, so the playfield stays correct
+//!   on any window aspect ratio.
+//! * Issue one render pass per frame that clears the full surface
+//!   to black (no longer used as letterbox), sets the viewport to
+//!   the full framebuffer and pushes a `vec2` aspect scale to the
+//!   vertex shader. The shader then squeezes the wider axis so a
+//!   unit circle in game space stays round on any monitor (4:3,
+//!   16:9, 21:9, 32:9, portrait, anything), without ever stretching
+//!   the image. Wider monitors simply reveal more of the radial
+//!   hex tunnel.
+//! Notably absent on purpose: any descriptor sets, push constants,
+//! audio, font rendering, or game logic. Adding them later does not
+//! require restructuring anything in this file beyond `render_frame`.
 //!
-//! Notably absent on purpose: any pipelines, shaders, vertex buffers,
-//! descriptor sets, or game logic. Adding them later does not require
-//! restructuring anything in this file beyond `render_frame`.
+//! # VSync
+//!
+//! The present mode used when building the swapchain is now taken
+//! from [`VsyncMode`]:
+//!
+//! * `Off`  -> `IMMEDIATE` if available, otherwise `MAILBOX`,
+//!             otherwise `FIFO`.
+//! * `On`   -> `FIFO` (guaranteed by the spec, no tearing).
+//! * `Fast` -> `MAILBOX` if available, otherwise `FIFO`.
+//!
+//! # FPS cap
+//!
+//! The cap itself is driven by the main loop using a monotonic
+//! clock; the renderer exposes a small helper, [`FramePacer`],
+//! that encapsulates "sleep until target_time" without drifting.
+//!
+//! # Post-process pipeline
+//!
+//! As of this revision the renderer no longer draws the scene
+//! directly into the swapchain. Instead [`crate::post::PostStage`]
+//! owns an offscreen color target; the main pipeline renders the
+//! scene into it, then a fullscreen post pipeline samples the
+//! offscreen target and writes the final image into the swapchain,
+//! applying bloom / vignette / chromatic aberration / scanlines /
+//! film grain / colorblind / high-contrast effects driven by
+//! [`crate::post::PostParams`]. The effect parameters are pushed
+//! once per frame through [`Renderer::set_post_params`].
 
 use ash::{vk, Device, Entry, Instance};
 use std::ffi::{c_void, CString};
+use std::time::{Duration, Instant};
+
+use crate::buffer::DynamicVertexBuffer;
+use crate::config::VsyncMode;
+use crate::pipeline::{Pipeline, PushConstants, Vertex};
+use crate::post::{PostParams, PostStage};
 
 /// How many frames may be in flight on the GPU simultaneously. Two is a
 /// good compromise between latency and CPU/GPU overlap for a fast paced
 /// game like this one.
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
+
+/// Maximum number of vertices a single frame may submit. Used to size
+/// every per frame vertex buffer at startup. A few thousand is plenty
+/// for the current art style; pick a power of two for nice alignment.
+const VERTEX_CAPACITY: usize = 131_072;
 
 pub struct Renderer {
     _entry:           Entry,
@@ -43,16 +91,34 @@ pub struct Renderer {
     swapchain_extent: vk::Extent2D,
     swapchain_views:  Vec<vk::ImageView>,
 
-    render_pass:      vk::RenderPass,
-    framebuffers:     Vec<vk::Framebuffer>,
+    /// Post-process stage. Owns the offscreen target, both
+    /// render passes (offscreen + post), the swapchain
+    /// framebuffers and the post pipeline / descriptor set.
+    /// The main pipeline is created against
+    /// `post.offscreen_render_pass()`.
+    post: PostStage,
 
     command_pool:     vk::CommandPool,
     command_buffers:  Vec<vk::CommandBuffer>,
+
+    /// Single graphics pipeline used for every draw call. Viewport and
+    /// scissor are dynamic, so this object survives window resizes.
+    pipeline:         Pipeline,
+    /// One host visible vertex buffer per frame in flight, written by
+    /// the CPU each frame and read directly by the GPU.
+    vertex_buffers:   Vec<DynamicVertexBuffer>,
 
     image_available:  [vk::Semaphore; MAX_FRAMES_IN_FLIGHT],
     render_finished:  [vk::Semaphore; MAX_FRAMES_IN_FLIGHT],
     in_flight:        [vk::Fence;     MAX_FRAMES_IN_FLIGHT],
     current_frame:    usize,
+
+    vsync:            VsyncMode,
+    vsync_dirty:      bool,
+
+    shake_offset:     [f32; 2],
+    post_params:      PostParams,
+    zoom_scale:       f32,
 }
 
 impl Renderer {
@@ -60,7 +126,7 @@ impl Renderer {
     /// supplied Win32 window. Panics on any unrecoverable setup failure;
     /// for a skeleton this is acceptable, real shipping code would
     /// surface these errors to the user.
-    pub fn new(hinstance: *mut c_void, hwnd: *mut c_void) -> Self {
+    pub fn new(hinstance: *mut c_void, hwnd: *mut c_void, vsync: VsyncMode) -> Self {
         unsafe {
             let entry = Entry::load().expect("Vulkan loader not present");
 
@@ -129,11 +195,14 @@ impl Renderer {
             let (swapchain, swapchain_format, swapchain_extent, swapchain_views) =
                 Self::build_swapchain(
                     &surface_loader, &swapchain_loader, &device,
-                    physical_device, surface, vk::SwapchainKHR::null());
+                    physical_device, surface, vk::SwapchainKHR::null(), vsync);
 
-            let render_pass = Self::build_render_pass(&device, swapchain_format);
-            let framebuffers = Self::build_framebuffers(
-                &device, render_pass, &swapchain_views, swapchain_extent);
+            // Post stage owns both render passes and the offscreen
+            // target. The main pipeline below is built against its
+            // offscreen render pass.
+            let post = PostStage::new(
+                &instance, physical_device, &device,
+                swapchain_format, &swapchain_views, swapchain_extent);
 
             let pool_info = vk::CommandPoolCreateInfo::default()
                 .queue_family_index(queue_family)
@@ -145,6 +214,20 @@ impl Renderer {
                 .level(vk::CommandBufferLevel::PRIMARY)
                 .command_buffer_count(MAX_FRAMES_IN_FLIGHT as u32);
             let command_buffers = device.allocate_command_buffers(&cb_info).unwrap();
+
+            // Pipeline only depends on the render pass being compatible,
+            // not on its concrete dimensions, so it lives across resizes.
+            // We wire it to the offscreen render pass owned by PostStage.
+            let pipeline = Pipeline::new(&device, post.offscreen_render_pass());
+
+            // One persistently mapped vertex buffer per frame in flight,
+            // so the CPU can write frame N+1 while the GPU consumes
+            // frame N without any extra synchronization.
+            let mut vertex_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
+            for _ in 0..MAX_FRAMES_IN_FLIGHT {
+                vertex_buffers.push(DynamicVertexBuffer::new(
+                    &instance, physical_device, &device, VERTEX_CAPACITY));
+            }
 
             // Per frame sync. Fences start signaled so the very first
             // wait_for_fences in render_frame returns immediately.
@@ -175,16 +258,47 @@ impl Renderer {
                 swapchain_format,
                 swapchain_extent,
                 swapchain_views,
-                render_pass,
-                framebuffers,
+                post,
                 command_pool,
                 command_buffers,
+                pipeline,
+                vertex_buffers,
                 image_available,
                 render_finished,
                 in_flight,
                 current_frame: 0,
+                vsync,
+                vsync_dirty: false,
+                shake_offset: [0.0, 0.0],
+                zoom_scale:   1.0,
+                post_params: PostParams::default(),
             }
         }
+    }
+
+    /// Change the vsync mode. Takes effect on the next frame by
+    /// forcing a swapchain rebuild.
+    pub fn set_vsync(&mut self, v: VsyncMode) {
+        if self.vsync != v {
+            self.vsync = v;
+            self.vsync_dirty = true;
+        }
+    }
+
+    pub fn vsync(&self) -> VsyncMode { self.vsync }
+
+    /// Set per-frame screen-shake offset, in game coordinates. The
+    /// value persists until changed so the caller does not need to
+    /// reset it every frame when unused.
+    pub fn set_shake(&mut self, offset: [f32; 2]) {
+        self.shake_offset = offset;
+    }
+
+    /// Publish the parameters the post fragment shader should use
+    /// for the next frame. Stored as-is and uploaded via push
+    /// constants inside `render_frame`.
+    pub fn set_post_params(&mut self, params: PostParams) {
+        self.post_params = params;
     }
 
     /// Build a brand new swapchain (and matching image views) for the
@@ -197,6 +311,7 @@ impl Renderer {
         physical_device:  vk::PhysicalDevice,
         surface:          vk::SurfaceKHR,
         old:              vk::SwapchainKHR,
+        vsync:            VsyncMode,
     ) -> (vk::SwapchainKHR, vk::Format, vk::Extent2D, Vec<vk::ImageView>) {
         let caps = surface_loader
             .get_physical_device_surface_capabilities(physical_device, surface).unwrap();
@@ -215,12 +330,27 @@ impl Renderer {
             })
             .unwrap_or(formats[0]);
 
-        // MAILBOX gives lowest latency tearing-free presentation when
-        // available; FIFO is the only mode guaranteed by the spec.
-        let present_mode = if modes.contains(&vk::PresentModeKHR::MAILBOX) {
-            vk::PresentModeKHR::MAILBOX
-        } else {
-            vk::PresentModeKHR::FIFO
+        // Choose present mode per requested vsync policy. Every
+        // fallback chain ends in FIFO, which the Vulkan spec
+        // guarantees is always supported.
+        let present_mode = match vsync {
+            VsyncMode::Off => {
+                if modes.contains(&vk::PresentModeKHR::IMMEDIATE) {
+                    vk::PresentModeKHR::IMMEDIATE
+                } else if modes.contains(&vk::PresentModeKHR::MAILBOX) {
+                    vk::PresentModeKHR::MAILBOX
+                } else {
+                    vk::PresentModeKHR::FIFO
+                }
+            }
+            VsyncMode::On   => vk::PresentModeKHR::FIFO,
+            VsyncMode::Fast => {
+                if modes.contains(&vk::PresentModeKHR::MAILBOX) {
+                    vk::PresentModeKHR::MAILBOX
+                } else {
+                    vk::PresentModeKHR::FIFO
+                }
+            }
         };
 
         // Some platforms report u32::MAX in current_extent meaning "you
@@ -273,88 +403,19 @@ impl Renderer {
         (swapchain, format.format, extent, views)
     }
 
-    /// Single subpass render pass that clears the color attachment on
-    /// load and stores it for presentation. All real geometry will live
-    /// inside this same subpass for now.
-    unsafe fn build_render_pass(device: &Device, format: vk::Format) -> vk::RenderPass {
-        let attachment = vk::AttachmentDescription::default()
-            .format(format)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-            .initial_layout(vk::ImageLayout::UNDEFINED)
-            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
-
-        let color_ref = [vk::AttachmentReference {
-            attachment: 0,
-            layout:     vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-        }];
-
-        let subpass = vk::SubpassDescription::default()
-            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-            .color_attachments(&color_ref);
-
-        // External to subpass 0 dependency so the implicit layout
-        // transition from PRESENT_SRC to COLOR_ATTACHMENT happens after
-        // the swapchain image is acquired.
-        let dep = vk::SubpassDependency {
-            src_subpass:      vk::SUBPASS_EXTERNAL,
-            dst_subpass:      0,
-            src_stage_mask:   vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            dst_stage_mask:   vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            src_access_mask:  vk::AccessFlags::empty(),
-            dst_access_mask:  vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-            dependency_flags: vk::DependencyFlags::empty(),
-        };
-
-        let attachments = [attachment];
-        let subpasses   = [subpass];
-        let deps        = [dep];
-
-        let info = vk::RenderPassCreateInfo::default()
-            .attachments(&attachments)
-            .subpasses(&subpasses)
-            .dependencies(&deps);
-
-        device.create_render_pass(&info, None).unwrap()
-    }
-
-    /// One framebuffer per swapchain image view.
-    unsafe fn build_framebuffers(
-        device:      &Device,
-        render_pass: vk::RenderPass,
-        views:       &[vk::ImageView],
-        extent:      vk::Extent2D,
-    ) -> Vec<vk::Framebuffer> {
-        views.iter().map(|&v| {
-            let attachments = [v];
-            let info = vk::FramebufferCreateInfo::default()
-                .render_pass(render_pass)
-                .attachments(&attachments)
-                .width(extent.width)
-                .height(extent.height)
-                .layers(1);
-            device.create_framebuffer(&info, None).unwrap()
-        }).collect()
-    }
-
     /// Tear down everything that depends on the surface size and rebuild
     /// it. Called after WM_SIZE or after a swapchain becomes out of date.
     pub fn recreate_swapchain(&mut self) {
         unsafe {
             self.device.device_wait_idle().ok();
 
-            for &fb in &self.framebuffers { self.device.destroy_framebuffer(fb, None); }
-            for &v  in &self.swapchain_views { self.device.destroy_image_view(v, None); }
-            self.framebuffers.clear();
+            for &v in &self.swapchain_views { self.device.destroy_image_view(v, None); }
             self.swapchain_views.clear();
 
             let old = self.swapchain;
             let (sc, fmt, ext, views) = Self::build_swapchain(
                 &self.surface_loader, &self.swapchain_loader, &self.device,
-                self.physical_device, self.surface, old);
+                self.physical_device, self.surface, old, self.vsync);
             self.swapchain_loader.destroy_swapchain(old, None);
 
             self.swapchain        = sc;
@@ -362,17 +423,30 @@ impl Renderer {
             self.swapchain_extent = ext;
             self.swapchain_views  = views;
 
-            // Render pass keeps the same format so it does not need to be
-            // rebuilt. Framebuffers do, because they bake in the size.
-            self.framebuffers = Self::build_framebuffers(
-                &self.device, self.render_pass, &self.swapchain_views, self.swapchain_extent);
+            // PostStage owns the offscreen image and all framebuffers
+            // (both offscreen and swapchain); ask it to rebuild them
+            // at the new size and rebind the descriptor set.
+            self.post.recreate(
+                &self.instance, self.physical_device, &self.device,
+                &self.swapchain_views, self.swapchain_extent);
         }
+        self.vsync_dirty = false;
     }
 
-    /// Submit a single frame. The animated clear colors prove that the
-    /// CPU side game loop, the GPU command stream and the Win32 message
-    /// pump are all running together.
-    pub fn render_frame(&mut self, time: f32) {
+    /// Upload the supplied vertex list into this frame's vertex buffer
+    /// and submit one draw call covering the whole list.
+    ///
+    /// The vertex positions are expected to already be in Vulkan NDC,
+    /// produced under the assumption that the viewport covers a
+    /// centered square. The renderer enforces that assumption here by
+    /// programming a dynamic viewport plus scissor matching exactly
+    /// that square; everything outside is filled with the render pass
+    /// clear color (black) and serves as letterbox or pillarbox area.
+    pub fn render_frame(&mut self, vertices: &[Vertex]) {
+        if self.vsync_dirty {
+            self.recreate_swapchain();
+        }
+
         unsafe {
             // Skip frames while the window is minimized to avoid
             // allocating zero-sized swapchains on resize.
@@ -396,56 +470,89 @@ impl Renderer {
 
             self.device.reset_fences(&[self.in_flight[frame]]).unwrap();
 
+            // Safe to write because the fence above guarantees the GPU
+            // is done reading the previous contents of this same buffer.
+            self.vertex_buffers[frame].upload(vertices);
+            let vertex_count = self.vertex_buffers[frame].count as u32;
+
             let cmd = self.command_buffers[frame];
             self.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).unwrap();
 
             let begin = vk::CommandBufferBeginInfo::default();
             self.device.begin_command_buffer(cmd, &begin).unwrap();
 
-            // Outer background pulse, slow.
-            let bg = 0.04 + 0.04 * (time * 0.7).sin().abs();
-            let clear_values = [vk::ClearValue {
-                color: vk::ClearColorValue { float32: [bg, bg * 0.5, bg * 1.5, 1.0] },
-            }];
+            // ---- pass 1: main scene into the offscreen target ----
 
-            let rp_begin = vk::RenderPassBeginInfo::default()
-                .render_pass(self.render_pass)
-                .framebuffer(self.framebuffers[image_index as usize])
-                .render_area(vk::Rect2D {
-                    offset: vk::Offset2D { x: 0, y: 0 },
-                    extent: self.swapchain_extent,
-                })
-                .clear_values(&clear_values);
-            self.device.cmd_begin_render_pass(cmd, &rp_begin, vk::SubpassContents::INLINE);
+            self.post.begin_offscreen(&self.device, cmd, self.swapchain_extent);
 
-            // Centered square that represents the playfield. This is
-            // computed every frame from the live extent so any aspect
-            // ratio (4:3, 16:9, 21:9, 32:9, portrait, anything) just
-            // works without code changes.
-            let (sx, sy, ss) = playfield_rect(self.swapchain_extent.width,
-                                              self.swapchain_extent.height);
-            let pulse = 0.15 + 0.15 * (time * 1.7).sin().abs();
-            let clear_attach = [vk::ClearAttachment {
-                aspect_mask:      vk::ImageAspectFlags::COLOR,
-                color_attachment: 0,
-                clear_value:      vk::ClearValue { color: vk::ClearColorValue {
-                    float32: [pulse, pulse * 0.3, pulse * 0.6, 1.0],
-                }},
-            }];
-            let clear_rect = [vk::ClearRect {
-                rect: vk::Rect2D {
-                    offset: vk::Offset2D { x: sx as i32, y: sy as i32 },
-                    extent: vk::Extent2D { width: ss, height: ss },
-                },
-                base_array_layer: 0,
-                layer_count:      1,
-            }];
-            self.device.cmd_clear_attachments(cmd, &clear_attach, &clear_rect);
+            // Full screen viewport plus matching scissor. We no
+            // longer carve out a centered square: the pipeline's
+            // vertex shader applies a `vec2 scale` push constant
+            // that takes care of aspect correction without losing
+            // any pixels to letterboxing.
+            let viewport = vk::Viewport {
+                x:         0.0,
+                y:         0.0,
+                width:     self.swapchain_extent.width  as f32,
+                height:    self.swapchain_extent.height as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            };
+            let scissor = vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: self.swapchain_extent,
+            };
+            self.device.cmd_set_viewport(cmd, 0, &[viewport]);
+            self.device.cmd_set_scissor (cmd, 0, &[scissor]);
 
-            // Future hook: bind a pipeline and draw the hexagon, walls,
-            // player and HUD here using the same `cmd`.
+            // Push the aspect scale + shake offset to the vertex
+            // shader. 16 bytes total; sent as a raw byte slice.
+            let (sx, sy) = aspect_scale(self.swapchain_extent.width,
+                                        self.swapchain_extent.height);
+            let pc = PushConstants {
+                scale: [sx, sy],
+                shake: self.shake_offset,
+                zoom:  self.zoom_scale,
+                _pad:  [0.0, 0.0, 0.0],
+            };
+            let push_bytes = std::slice::from_raw_parts(
+                (&pc as *const PushConstants) as *const u8,
+                std::mem::size_of::<PushConstants>(),
+            );
+            self.device.cmd_push_constants(
+                cmd,
+                self.pipeline.layout,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                push_bytes,
+            );
 
-            self.device.cmd_end_render_pass(cmd);
+            // Bind once, draw the entire triangle list. With no index
+            // buffer and no instancing this is the minimum amount of
+            // command stream needed to put pixels on screen.
+            if vertex_count > 0 {
+                self.device.cmd_bind_pipeline(
+                    cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline.pipeline);
+                self.device.cmd_bind_vertex_buffers(
+                    cmd, 0, &[self.vertex_buffers[frame].buffer], &[0]);
+                self.device.cmd_draw(cmd, vertex_count, 1, 0, 0);
+            }
+
+            self.post.end_render_pass(&self.device, cmd);
+
+            // ---- pass 2: post process into the swapchain ----
+
+            // The resolution field is filled per frame because the
+            // window can resize between calls.
+            let mut params = self.post_params;
+            params.resolution = [
+                self.swapchain_extent.width  as f32,
+                self.swapchain_extent.height as f32,
+            ];
+            self.post.render_post(
+                &self.device, cmd, image_index,
+                self.swapchain_extent, &params);
+
             self.device.end_command_buffer(cmd).unwrap();
 
             let wait_sems   = [self.image_available[frame]];
@@ -484,6 +591,14 @@ impl Renderer {
         unsafe {
             self.device.device_wait_idle().ok();
 
+            // Per frame vertex buffers and the shared pipeline both
+            // outlive a single frame, so they live here at the top of
+            // the teardown sequence, just below the device wait.
+            for vb in &self.vertex_buffers {
+                vb.destroy(&self.device);
+            }
+            self.pipeline.destroy(&self.device);
+
             for i in 0..MAX_FRAMES_IN_FLIGHT {
                 self.device.destroy_semaphore(self.image_available[i], None);
                 self.device.destroy_semaphore(self.render_finished[i], None);
@@ -491,8 +606,10 @@ impl Renderer {
             }
             self.device.destroy_command_pool(self.command_pool, None);
 
-            for &fb in &self.framebuffers { self.device.destroy_framebuffer(fb, None); }
-            self.device.destroy_render_pass(self.render_pass, None);
+            // PostStage owns both render passes and all framebuffers.
+            // Destroy it before the swapchain views it references.
+            self.post.destroy(&self.device);
+
             for &v in &self.swapchain_views { self.device.destroy_image_view(v, None); }
             self.swapchain_loader.destroy_swapchain(self.swapchain, None);
 
@@ -501,17 +618,88 @@ impl Renderer {
             self.instance.destroy_instance(None);
         }
     }
+
+    /// Uniform camera zoom applied in the vertex shader before
+    /// aspect correction. Values above 1.0 zoom in.
+    pub fn set_zoom(&mut self, z: f32) {
+        self.zoom_scale = z.clamp(0.25, 3.0);
+    }
 }
 
-/// Compute the centered square sub-region of a `w x h` framebuffer that
-/// will host the actual game. The remaining pixels become letterbox or
-/// pillarbox depending on the aspect ratio.
+/// Compute the per axis scale the vertex shader applies to keep a
+/// unit circle round on any framebuffer aspect ratio.
 ///
-/// Returns `(x, y, side)` where `(x, y)` is the top-left corner inside
-/// the framebuffer and `side` is the length of the square in pixels.
-pub fn playfield_rect(w: u32, h: u32) -> (u32, u32, u32) {
-    let s = w.min(h);
-    let x = (w - s) / 2;
-    let y = (h - s) / 2;
-    (x, y, s)
+/// Convention: the longer axis ends up at scale 1.0 (that is, game
+/// space coordinates `[-1, 1]` map directly onto NDC `[-1, 1]` along
+/// the long axis). The shorter axis is squeezed by the inverse
+/// aspect ratio, so a square drawn at `[-1, 1]` in game space ends
+/// up visually square instead of stretched.
+///
+/// The same function is used by the menu module to convert mouse
+/// pixel positions back into game space, so widget hit boxes and
+/// rendered widget shapes stay perfectly aligned regardless of the
+/// window aspect ratio.
+pub fn aspect_scale(w: u32, h: u32) -> (f32, f32) {
+    let w = w.max(1) as f32;
+    let h = h.max(1) as f32;
+    if w >= h {
+        (h / w, 1.0)
+    } else {
+        (1.0, w / h)
+    }
+}
+
+/// Dead simple frame pacer. The main loop keeps a `FramePacer`
+/// instance and calls [`FramePacer::begin`] / [`FramePacer::wait`]
+/// around each iteration. At zero target FPS the pacer is a no-op
+/// so uncapped frame rates do not pay for unused logic.
+///
+/// The implementation combines a coarse sleep for the bulk of the
+/// wait and a tight spin for the last ~1 ms, which is accurate on
+/// Windows without relying on `timeBeginPeriod`.
+pub struct FramePacer {
+    target: Option<Duration>,
+    next_frame: Instant,
+}
+
+impl FramePacer {
+    pub fn new(fps: u32) -> Self {
+        FramePacer {
+            target: if fps == 0 { None } else { Some(Duration::from_secs_f64(1.0 / fps as f64)) },
+            next_frame: Instant::now(),
+        }
+    }
+
+    pub fn set_fps(&mut self, fps: u32) {
+        self.target = if fps == 0 {
+            None
+        } else {
+            Some(Duration::from_secs_f64(1.0 / fps as f64))
+        };
+        self.next_frame = Instant::now();
+    }
+
+    pub fn begin(&mut self) {
+        if self.target.is_none() { return; }
+        let now = Instant::now();
+        if now > self.next_frame + Duration::from_millis(100) {
+            self.next_frame = now;
+        }
+    }
+
+    /// Block until the next frame slot opens. Uses a hybrid sleep +
+    /// spin strategy to stay within ~0.5 ms of the target.
+    pub fn wait(&mut self) {
+        let Some(period) = self.target else { return; };
+        self.next_frame += period;
+        let now = Instant::now();
+        if self.next_frame <= now { return; }
+        let remaining = self.next_frame - now;
+        if remaining > Duration::from_millis(2) {
+            std::thread::sleep(remaining - Duration::from_millis(1));
+        }
+        while Instant::now() < self.next_frame {
+            std::hint::spin_loop();
+        }
+    }
 }

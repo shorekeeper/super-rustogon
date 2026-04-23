@@ -1,13 +1,11 @@
-//! Hand-written Win32 bindings, just enough to host a Vulkan surface.
+//! Hand-written Win32 bindings, just enough to host a Vulkan surface
+//! and report keyboard plus mouse input.
 //!
-//! Only the symbols actually used by the renderer are declared here.
-//! All declarations follow the standard `windows.h` ABI, so this module
-//! can be cross-checked against MSDN one for one.
+//! (See original module documentation above.)
 //!
-//! Window state shared with the rest of the program (close flag, last
-//! known client size, resize signal) lives in process-wide atomics so
-//! that the C-side `WndProc` callback does not need access to any Rust
-//! object. This keeps the FFI boundary trivial.
+//! This revision adds the Shift key (for the dash / slow-mo
+//! ability) and extends `Input` with a `shift` field. Esc, arrows,
+//! Space, Enter, Up, Down are unchanged.
 
 #![allow(non_snake_case, non_camel_case_types, dead_code)]
 
@@ -36,35 +34,28 @@ pub type LONG      = i32;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct POINT { pub x: LONG, pub y: LONG }
-
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RECT { pub left: LONG, pub top: LONG, pub right: LONG, pub bottom: LONG }
 
 #[repr(C)]
 pub struct MSG {
-    pub hwnd:    HWND,
-    pub message: UINT,
-    pub wParam:  WPARAM,
-    pub lParam:  LPARAM,
-    pub time:    DWORD,
-    pub pt:      POINT,
+    pub hwnd: HWND, pub message: UINT,
+    pub wParam: WPARAM, pub lParam: LPARAM,
+    pub time: DWORD, pub pt: POINT,
 }
 
 pub type WNDPROC = unsafe extern "system" fn(HWND, UINT, WPARAM, LPARAM) -> LRESULT;
 
 #[repr(C)]
 pub struct WNDCLASSW {
-    pub style:         UINT,
-    pub lpfnWndProc:   WNDPROC,
-    pub cbClsExtra:    c_int,
-    pub cbWndExtra:    c_int,
-    pub hInstance:     HINSTANCE,
-    pub hIcon:         HICON,
-    pub hCursor:       HCURSOR,
+    pub style: UINT,
+    pub lpfnWndProc: WNDPROC,
+    pub cbClsExtra: c_int, pub cbWndExtra: c_int,
+    pub hInstance: HINSTANCE,
+    pub hIcon: HICON, pub hCursor: HCURSOR,
     pub hbrBackground: HBRUSH,
-    pub lpszMenuName:  LPCWSTR,
-    pub lpszClassName: LPCWSTR,
+    pub lpszMenuName: LPCWSTR, pub lpszClassName: LPCWSTR,
 }
 
 pub const WS_OVERLAPPEDWINDOW: DWORD = 0x00CF0000;
@@ -73,14 +64,28 @@ pub const SW_SHOW:             c_int = 5;
 pub const CW_USEDEFAULT:       c_int = 0x80000000u32 as c_int;
 pub const PM_REMOVE:           UINT  = 0x0001;
 
-pub const WM_DESTROY: UINT   = 0x0002;
-pub const WM_SIZE:    UINT   = 0x0005;
-pub const WM_CLOSE:   UINT   = 0x0010;
-pub const WM_QUIT:    UINT   = 0x0012;
-pub const WM_KEYDOWN: UINT   = 0x0100;
+pub const WM_DESTROY:     UINT = 0x0002;
+pub const WM_SIZE:        UINT = 0x0005;
+pub const WM_CLOSE:       UINT = 0x0010;
+pub const WM_QUIT:        UINT = 0x0012;
+pub const WM_KEYDOWN:     UINT = 0x0100;
+pub const WM_KEYUP:       UINT = 0x0101;
+pub const WM_MOUSEMOVE:   UINT = 0x0200;
+pub const WM_LBUTTONDOWN: UINT = 0x0201;
+pub const WM_LBUTTONUP:   UINT = 0x0202;
 
-pub const VK_ESCAPE:  WPARAM = 0x1B;
-pub const IDC_ARROW:  LPCWSTR = 32512usize as LPCWSTR;
+pub const VK_ESCAPE: WPARAM = 0x1B;
+pub const VK_LEFT:   WPARAM = 0x25;
+pub const VK_UP:     WPARAM = 0x26;
+pub const VK_RIGHT:  WPARAM = 0x27;
+pub const VK_DOWN:   WPARAM = 0x28;
+pub const VK_SPACE:  WPARAM = 0x20;
+pub const VK_RETURN: WPARAM = 0x0D;
+pub const VK_SHIFT:  WPARAM = 0x10;
+pub const VK_LSHIFT: WPARAM = 0xA0;
+pub const VK_RSHIFT: WPARAM = 0xA1;
+
+pub const IDC_ARROW: LPCWSTR = 32512usize as LPCWSTR;
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -90,24 +95,17 @@ unsafe extern "system" {
 #[link(name = "user32")]
 unsafe extern "system" {
     pub fn RegisterClassW(lpWndClass: *const WNDCLASSW) -> ATOM;
-
     pub fn CreateWindowExW(
-        dwExStyle:    DWORD,
-        lpClassName:  LPCWSTR,
-        lpWindowName: LPCWSTR,
-        dwStyle:      DWORD,
-        X: c_int, Y: c_int,
-        nWidth: c_int, nHeight: c_int,
-        hWndParent: HWND,
-        hMenu:      HMENU,
-        hInstance:  HINSTANCE,
-        lpParam:    *mut c_void,
+        dwExStyle: DWORD, lpClassName: LPCWSTR, lpWindowName: LPCWSTR,
+        dwStyle: DWORD, X: c_int, Y: c_int, nWidth: c_int, nHeight: c_int,
+        hWndParent: HWND, hMenu: HMENU, hInstance: HINSTANCE,
+        lpParam: *mut c_void,
     ) -> HWND;
-
     pub fn DefWindowProcW(hWnd: HWND, Msg: UINT, wParam: WPARAM, lParam: LPARAM) -> LRESULT;
     pub fn ShowWindow(hWnd: HWND, nCmdShow: c_int) -> BOOL;
     pub fn UpdateWindow(hWnd: HWND) -> BOOL;
-    pub fn PeekMessageW(lpMsg: *mut MSG, hWnd: HWND, wMsgFilterMin: UINT, wMsgFilterMax: UINT, wRemoveMsg: UINT) -> BOOL;
+    pub fn PeekMessageW(lpMsg: *mut MSG, hWnd: HWND,
+        wMsgFilterMin: UINT, wMsgFilterMax: UINT, wRemoveMsg: UINT) -> BOOL;
     pub fn TranslateMessage(lpMsg: *const MSG) -> BOOL;
     pub fn DispatchMessageW(lpMsg: *const MSG) -> LRESULT;
     pub fn PostQuitMessage(nExitCode: c_int);
@@ -115,61 +113,111 @@ unsafe extern "system" {
     pub fn LoadCursorW(hInstance: HINSTANCE, lpCursorName: LPCWSTR) -> HCURSOR;
 }
 
-/// Set when the user requests the window to close (Alt+F4, click X, or Esc).
 static SHOULD_CLOSE: AtomicBool = AtomicBool::new(false);
-/// Most recently observed client width / height in pixels.
 static CLIENT_W: AtomicI32 = AtomicI32::new(0);
 static CLIENT_H: AtomicI32 = AtomicI32::new(0);
-/// Sticky flag the renderer drains via `take_resized` to know it should
-/// rebuild its swapchain.
 static RESIZED: AtomicBool = AtomicBool::new(false);
 
-/// The C-side window procedure. Kept tiny on purpose: it only translates
-/// the few messages the renderer cares about into atomic side effects.
+static KEY_LEFT:   AtomicBool = AtomicBool::new(false);
+static KEY_RIGHT:  AtomicBool = AtomicBool::new(false);
+static KEY_UP:     AtomicBool = AtomicBool::new(false);
+static KEY_DOWN:   AtomicBool = AtomicBool::new(false);
+static KEY_SPACE:  AtomicBool = AtomicBool::new(false);
+static KEY_ENTER:  AtomicBool = AtomicBool::new(false);
+static KEY_ESCAPE: AtomicBool = AtomicBool::new(false);
+static KEY_SHIFT:  AtomicBool = AtomicBool::new(false);
+
+static MOUSE_X: AtomicI32 = AtomicI32::new(0);
+static MOUSE_Y: AtomicI32 = AtomicI32::new(0);
+static MOUSE_LEFT: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Input {
+    pub left:   bool,
+    pub right:  bool,
+    pub up:     bool,
+    pub down:   bool,
+    pub space:  bool,
+    pub enter:  bool,
+    pub escape: bool,
+    pub shift:  bool,
+}
+
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Mouse {
+    pub x: i32, pub y: i32,
+    pub left_down: bool,
+}
+
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, w: WPARAM, l: LPARAM) -> LRESULT {
     match msg {
         WM_CLOSE | WM_DESTROY => {
             SHOULD_CLOSE.store(true, Ordering::SeqCst);
-            PostQuitMessage(0);
+            unsafe { PostQuitMessage(0); }
             0
         }
-        WM_KEYDOWN if w == VK_ESCAPE => {
-            SHOULD_CLOSE.store(true, Ordering::SeqCst);
+        WM_KEYDOWN => {
+            match w {
+                VK_ESCAPE => KEY_ESCAPE.store(true, Ordering::SeqCst),
+                VK_LEFT   => KEY_LEFT.store(true, Ordering::SeqCst),
+                VK_RIGHT  => KEY_RIGHT.store(true, Ordering::SeqCst),
+                VK_UP     => KEY_UP.store(true, Ordering::SeqCst),
+                VK_DOWN   => KEY_DOWN.store(true, Ordering::SeqCst),
+                VK_SPACE  => KEY_SPACE.store(true, Ordering::SeqCst),
+                VK_RETURN => KEY_ENTER.store(true, Ordering::SeqCst),
+                VK_SHIFT | VK_LSHIFT | VK_RSHIFT
+                          => KEY_SHIFT.store(true, Ordering::SeqCst),
+                _ => {}
+            }
             0
         }
+        WM_KEYUP => {
+            match w {
+                VK_ESCAPE => KEY_ESCAPE.store(false, Ordering::SeqCst),
+                VK_LEFT   => KEY_LEFT.store(false, Ordering::SeqCst),
+                VK_RIGHT  => KEY_RIGHT.store(false, Ordering::SeqCst),
+                VK_UP     => KEY_UP.store(false, Ordering::SeqCst),
+                VK_DOWN   => KEY_DOWN.store(false, Ordering::SeqCst),
+                VK_SPACE  => KEY_SPACE.store(false, Ordering::SeqCst),
+                VK_RETURN => KEY_ENTER.store(false, Ordering::SeqCst),
+                VK_SHIFT | VK_LSHIFT | VK_RSHIFT
+                          => KEY_SHIFT.store(false, Ordering::SeqCst),
+                _ => {}
+            }
+            0
+        }
+        WM_MOUSEMOVE => {
+            let nx = (l & 0xFFFF) as i16 as i32;
+            let ny = ((l >> 16) & 0xFFFF) as i16 as i32;
+            MOUSE_X.store(nx, Ordering::SeqCst);
+            MOUSE_Y.store(ny, Ordering::SeqCst);
+            0
+        }
+        WM_LBUTTONDOWN => { MOUSE_LEFT.store(true, Ordering::SeqCst); 0 }
+        WM_LBUTTONUP   => { MOUSE_LEFT.store(false, Ordering::SeqCst); 0 }
         WM_SIZE => {
-            // LOWORD / HIWORD of lParam carry the new client size.
-            let nw = (l        & 0xFFFF) as i32;
+            let nw = (l & 0xFFFF) as i32;
             let nh = ((l >> 16) & 0xFFFF) as i32;
             CLIENT_W.store(nw, Ordering::SeqCst);
             CLIENT_H.store(nh, Ordering::SeqCst);
             RESIZED.store(true, Ordering::SeqCst);
             0
         }
-        _ => DefWindowProcW(hwnd, msg, w, l),
+        _ => unsafe { DefWindowProcW(hwnd, msg, w, l) },
     }
 }
 
-/// Convert a Rust `&str` to a null terminated UTF-16 buffer suitable for
-/// the `*W` family of Win32 calls.
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// RAII-ish handle to a top level Win32 window. Owns nothing the OS would
-/// not free on process exit, so a missing Drop impl is acceptable for the
-/// skeleton.
 pub struct Window {
     pub hinstance: HINSTANCE,
-    pub hwnd:      HWND,
-    /// Kept alive so that the class name pointer in WNDCLASSW remains valid.
-    _class_name:   Vec<u16>,
+    pub hwnd: HWND,
+    _class_name: Vec<u16>,
 }
 
 impl Window {
-    /// Create and show a top level window with the given caption and initial
-    /// client size hint. The system may pick a different actual size; the
-    /// renderer must always re-query.
     pub fn new(title: &str, width: i32, height: i32) -> Self {
         unsafe {
             let hinstance = GetModuleHandleW(ptr::null());
@@ -178,26 +226,19 @@ impl Window {
             let cursor = LoadCursorW(ptr::null_mut(), IDC_ARROW);
 
             let wc = WNDCLASSW {
-                style:         0,
-                lpfnWndProc:   wnd_proc,
-                cbClsExtra:    0,
-                cbWndExtra:    0,
-                hInstance:     hinstance,
-                hIcon:         ptr::null_mut(),
-                hCursor:       cursor,
+                style: 0, lpfnWndProc: wnd_proc,
+                cbClsExtra: 0, cbWndExtra: 0,
+                hInstance: hinstance,
+                hIcon: ptr::null_mut(), hCursor: cursor,
                 hbrBackground: ptr::null_mut(),
-                lpszMenuName:  ptr::null(),
-                lpszClassName: class_name.as_ptr(),
+                lpszMenuName: ptr::null(), lpszClassName: class_name.as_ptr(),
             };
             assert!(RegisterClassW(&wc) != 0, "RegisterClassW failed");
 
             let hwnd = CreateWindowExW(
-                0,
-                class_name.as_ptr(),
-                title_w.as_ptr(),
+                0, class_name.as_ptr(), title_w.as_ptr(),
                 WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                CW_USEDEFAULT, CW_USEDEFAULT,
-                width, height,
+                CW_USEDEFAULT, CW_USEDEFAULT, width, height,
                 ptr::null_mut(), ptr::null_mut(), hinstance, ptr::null_mut(),
             );
             assert!(!hwnd.is_null(), "CreateWindowExW failed");
@@ -205,8 +246,6 @@ impl Window {
             ShowWindow(hwnd, SW_SHOW);
             UpdateWindow(hwnd);
 
-            // Seed the size atomics with the requested values. WM_SIZE will
-            // overwrite them with the truthful numbers very shortly.
             CLIENT_W.store(width, Ordering::SeqCst);
             CLIENT_H.store(height, Ordering::SeqCst);
 
@@ -214,7 +253,6 @@ impl Window {
         }
     }
 
-    /// Drain every pending message in the queue without blocking.
     pub fn poll_events(&self) {
         unsafe {
             let mut msg: MSG = std::mem::zeroed();
@@ -228,22 +266,33 @@ impl Window {
         }
     }
 
-    /// True once the user (or our Esc handler) has asked the program to quit.
-    pub fn should_close(&self) -> bool {
-        SHOULD_CLOSE.load(Ordering::SeqCst)
-    }
+    pub fn should_close(&self) -> bool { SHOULD_CLOSE.load(Ordering::SeqCst) }
 
-    /// Current client size, clamped away from zero so callers can divide
-    /// by it safely. The renderer additionally checks for a minimized
-    /// window and bails out before allocating a degenerate swapchain.
     pub fn client_size(&self) -> (u32, u32) {
         (CLIENT_W.load(Ordering::SeqCst).max(1) as u32,
          CLIENT_H.load(Ordering::SeqCst).max(1) as u32)
     }
 
-    /// Atomically read the resize flag and clear it. The renderer calls
-    /// this once per frame to decide whether to rebuild the swapchain.
-    pub fn take_resized(&self) -> bool {
-        RESIZED.swap(false, Ordering::SeqCst)
+    pub fn take_resized(&self) -> bool { RESIZED.swap(false, Ordering::SeqCst) }
+
+    pub fn input(&self) -> Input {
+        Input {
+            left:   KEY_LEFT.load  (Ordering::SeqCst),
+            right:  KEY_RIGHT.load (Ordering::SeqCst),
+            up:     KEY_UP.load    (Ordering::SeqCst),
+            down:   KEY_DOWN.load  (Ordering::SeqCst),
+            space:  KEY_SPACE.load (Ordering::SeqCst),
+            enter:  KEY_ENTER.load (Ordering::SeqCst),
+            escape: KEY_ESCAPE.load(Ordering::SeqCst),
+            shift:  KEY_SHIFT.load (Ordering::SeqCst),
+        }
+    }
+
+    pub fn mouse(&self) -> Mouse {
+        Mouse {
+            x: MOUSE_X.load(Ordering::SeqCst),
+            y: MOUSE_Y.load(Ordering::SeqCst),
+            left_down: MOUSE_LEFT.load(Ordering::SeqCst),
+        }
     }
 }
