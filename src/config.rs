@@ -269,6 +269,51 @@ impl HighlightMode {
     }
 }
 
+/// Policy for the user shader sandbox. Starts at `Off` so a
+/// fresh install never executes author supplied GPU code until
+/// the user opts in. `Audit` compiles and validates but does not
+/// render, which is useful for shader authors who want to test
+/// their programs without putting the driver at risk. `On` lets
+/// validated shaders become the active post pipeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CustomShaders {
+    Off,
+    Audit,
+    On,
+}
+
+impl CustomShaders {
+    pub fn label(self) -> &'static str {
+        match self {
+            CustomShaders::Off   => "OFF",
+            CustomShaders::Audit => "AUDIT",
+            CustomShaders::On    => "ON",
+        }
+    }
+    pub fn next(self) -> Self {
+        match self {
+            CustomShaders::Off   => CustomShaders::Audit,
+            CustomShaders::Audit => CustomShaders::On,
+            CustomShaders::On    => CustomShaders::Off,
+        }
+    }
+    pub fn from_str_key(s: &str) -> Self {
+        match s {
+            "off"   => CustomShaders::Off,
+            "audit" => CustomShaders::Audit,
+            "on"    => CustomShaders::On,
+            _       => CustomShaders::Off,
+        }
+    }
+    pub fn to_str_key(self) -> &'static str {
+        match self {
+            CustomShaders::Off   => "off",
+            CustomShaders::Audit => "audit",
+            CustomShaders::On    => "on",
+        }
+    }
+}
+
 /// Everything the user can customize, flat for easy persistence.
 ///
 /// Every field has both a reasonable default (see [`Config::default`])
@@ -314,6 +359,9 @@ pub struct Config {
     pub reduce_motion:  bool,
     pub show_hitboxes:  bool,
     pub colorblind:     ColorblindMode,
+
+    // ---- power user ----
+    pub custom_shaders: CustomShaders,
 }
 
 impl Default for Config {
@@ -349,6 +397,8 @@ impl Default for Config {
             reduce_motion:  false,
             show_hitboxes:  false,
             colorblind:     ColorblindMode::Off,
+
+            custom_shaders: CustomShaders::Off,
         }
     }
 }
@@ -443,6 +493,8 @@ impl Config {
                 "show_hitboxes" => cfg.show_hitboxes = parse_bool(&v, false),
                 "colorblind"    => cfg.colorblind = ColorblindMode::from_str_key(&v),
 
+                "custom_shaders" => cfg.custom_shaders = CustomShaders::from_str_key(&v),
+
                 other => eprintln!("[config] unknown key '{}' ignored", other),
             }
         }
@@ -494,6 +546,10 @@ impl Config {
         kv(&mut s, "reduce_motion", if self.reduce_motion { "true" } else { "false" });
         kv(&mut s, "show_hitboxes", if self.show_hitboxes { "true" } else { "false" });
         kv(&mut s, "colorblind",    self.colorblind.to_str_key());
+        s.push('\n');
+
+        s.push_str("# ---- power user ----\n");
+        kv(&mut s, "custom_shaders", self.custom_shaders.to_str_key());
 
         s
     }

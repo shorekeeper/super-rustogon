@@ -54,7 +54,16 @@ pub struct PostParams {
     pub resolution:         [f32; 2],
     pub glitch:             f32,
     pub strobe:             f32,
-    pub _pad:               [f32; 2],
+    // v3 trigger extensions. Kept at the tail so the earlier
+    // field offsets match the original layout byte for byte.
+    pub invert_colors:      f32,
+    pub grayscale:          f32,
+    pub shockwave_progress: f32,
+    pub shockwave_strength: f32,
+    pub fog_near:           f32,
+    pub fog_far:            f32,
+    pub outline_amount:     f32,
+    pub _pad:               f32,
 }
 
 impl Default for PostParams {
@@ -71,7 +80,14 @@ impl Default for PostParams {
             resolution: [1.0, 1.0],
             glitch: 0.0,
             strobe: 0.0,
-            _pad: [0.0, 0.0],
+            invert_colors: 0.0,
+            grayscale: 0.0,
+            shockwave_progress: 0.0,
+            shockwave_strength: 0.0,
+            fog_near: 0.0,
+            fog_far: 0.0,
+            outline_amount: 0.0,
+            _pad: 0.0,
         }
     }
 }
@@ -331,6 +347,109 @@ impl PostStage {
 
             device.destroy_render_pass(self.post_render_pass, None);
             device.destroy_render_pass(self.offscreen_render_pass, None);
+        }
+    }
+    
+    /// Render pass the swapchain post pipeline is built
+    /// against. User shaders from the sandbox must be
+    /// compiled against this pass so the resulting pipeline
+    /// can be swapped in for the default one.
+    pub fn post_render_pass(&self) -> vk::RenderPass {
+        self.post_render_pass
+    }
+
+    /// Descriptor set layout used by the default post
+    /// pipeline. Exposed so the sandbox can build a user
+    /// pipeline with a compatible layout and the sandbox
+    /// pipeline can reuse the exact same descriptor set
+    /// the built in pipeline already has bound to the
+    /// offscreen target.
+    pub fn descriptor_set_layout(&self) -> vk::DescriptorSetLayout {
+        self.descriptor_set_layout
+    }
+
+    /// Swapchain image count, for sandbox bench rigs that
+    /// want to allocate per frame resources. Currently
+    /// unused by the shipped sandbox but stable enough to
+    /// be part of the public surface.
+    pub fn framebuffer_count(&self) -> usize {
+        self.post_framebuffers.len()
+    }
+
+    /// Variant of `render_post` that runs a user supplied
+    /// pipeline instead of the built in one. The caller is
+    /// responsible for:
+    ///
+    /// * Providing a pipeline compatible with
+    ///   `post_render_pass()` and `descriptor_set_layout()`.
+    /// * Providing push constant bytes whose length does not
+    ///   exceed the user pipeline's declared range. A short
+    ///   slice is padded with zeros, a longer one is
+    ///   truncated, which matches the "best effort" policy
+    ///   of the rest of the renderer.
+    ///
+    /// The descriptor set from the built in pipeline is
+    /// bound automatically, so the user shader samples the
+    /// same offscreen scene texture as the default post.
+    pub fn render_post_with_pipeline(
+        &self,
+        device:           &Device,
+        cmd:              vk::CommandBuffer,
+        image_index:      u32,
+        extent:           vk::Extent2D,
+        custom_pipeline:  vk::Pipeline,
+        custom_layout:    vk::PipelineLayout,
+        push_bytes:       &[u8],
+    ) {
+        unsafe {
+            let clear_values = [vk::ClearValue {
+                color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 1.0] },
+            }];
+            let rp_begin = vk::RenderPassBeginInfo::default()
+                .render_pass(self.post_render_pass)
+                .framebuffer(self.post_framebuffers[image_index as usize])
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent,
+                })
+                .clear_values(&clear_values);
+            device.cmd_begin_render_pass(
+                cmd, &rp_begin, vk::SubpassContents::INLINE);
+
+            let viewport = vk::Viewport {
+                x: 0.0, y: 0.0,
+                width:  extent.width  as f32,
+                height: extent.height as f32,
+                min_depth: 0.0, max_depth: 1.0,
+            };
+            let scissor = vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 }, extent,
+            };
+            device.cmd_set_viewport(cmd, 0, &[viewport]);
+            device.cmd_set_scissor (cmd, 0, &[scissor]);
+
+            device.cmd_bind_pipeline(
+                cmd, vk::PipelineBindPoint::GRAPHICS, custom_pipeline);
+            device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::GRAPHICS,
+                custom_layout, 0, &[self.descriptor_set], &[]);
+
+            // Push constants. Pad or truncate to 128 bytes
+            // to match the user pipeline's declared range,
+            // then push as a single call.
+            if !push_bytes.is_empty() {
+                let mut padded = [0u8; 128];
+                let n = push_bytes.len().min(padded.len());
+                padded[..n].copy_from_slice(&push_bytes[..n]);
+                device.cmd_push_constants(
+                    cmd, custom_layout,
+                    vk::ShaderStageFlags::FRAGMENT,
+                    0, &padded[..]);
+            }
+
+            device.cmd_draw(cmd, 3, 1, 0, 0);
+
+            device.cmd_end_render_pass(cmd);
         }
     }
 }

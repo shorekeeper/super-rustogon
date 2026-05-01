@@ -132,6 +132,18 @@ enum MusicCommand {
     Stop,
     SetPaused(bool),
     Seek(f32),
+    /// Set the playback rate of the currently loaded music
+    /// track. `1.0` is the source rate, `0.5` is half speed
+    /// (one octave lower pitch), `2.0` is double speed (one
+    /// octave higher pitch). The audio worker clamps the
+    /// value into `[0.1, 4.0]` before applying it to the
+    /// `MusicTrack`, which in turn already saturates to its
+    /// own safety range.
+    ///
+    /// Used by the simulation layer to honour the DSL
+    /// `speedwarp.music` axis: while a speedwarp trigger is
+    /// active the game scales the music rate every frame.
+    SetRate(f32),
 }
 
 struct Shared {
@@ -238,6 +250,15 @@ impl Audio {
     }
     pub fn seek_music(&self, seconds: f32) {
         self.push_cmd(MusicCommand::Seek(seconds));
+    }
+
+    /// Set the music playback rate. `1.0` is neutral; lower
+    /// values slow and lower-pitch the track, higher values
+    /// speed and raise it. The audio worker applies the change
+    /// on the next buffer fill so user-visible latency is one
+    /// audio buffer (~23 ms at the default sample rate).
+    pub fn set_music_rate(&self, rate: f32) {
+        self.push_cmd(MusicCommand::SetRate(rate));
     }
 
     fn push_cmd(&self, cmd: MusicCommand) {
@@ -542,6 +563,18 @@ impl SynthState {
                             os[self.music_onset_idx - 1]
                         };
                         self.music_prev_cursor = m.cursor_src_sample();
+                    }
+                }
+                MusicCommand::SetRate(r) => {
+                    // Applied immediately to the currently
+                    // playing track. If no track is loaded
+                    // the request is simply dropped; the
+                    // caller will re-issue it every frame
+                    // while the effect is active, so the next
+                    // track installed will pick up the rate
+                    // automatically via the follow-up message.
+                    if let Some(m) = self.music.as_mut() {
+                        m.set_rate(r);
                     }
                 }
             }

@@ -1,17 +1,3 @@
-// Fragment shader for the post-process pass.
-//
-// v2 extensions:
-//
-//  * `glitch` drives a horizontal band-displacement plus a
-//    per-band RGB tear, controlled in 0..1. Zero leaves the
-//    image untouched.
-//  * `strobe` multiplies the final color by (1 + strobe) so the
-//    picture briefly overbrights on DSL `strobe` triggers.
-//
-// The existing effect stack is unchanged; glitch slots in
-// between chromatic aberration (1) and bloom (2) so a glitched
-// frame can still feed its brightness into the bloom pass.
-
 #version 450
 
 layout(location = 0) in vec2 v_uv;
@@ -31,7 +17,14 @@ layout(push_constant) uniform Params {
     vec2  resolution;
     float glitch;
     float strobe;
-    vec2  _pad;
+    float invert_colors;
+    float grayscale;
+    float shockwave_progress;
+    float shockwave_strength;
+    float fog_near;
+    float fog_far;
+    float outline_amount;
+    float _pad;
 } pc;
 
 const float PI = 3.14159265359;
@@ -95,10 +88,6 @@ float hash21(vec2 p) {
     return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
 }
 
-// Glitch: split the frame into horizontal bands whose lateral
-// offset and per-channel separation is driven by a time-varying
-// hash. Banding is stable within a band and changes every few
-// pixels vertically, which reads as VHS tearing.
 vec3 apply_glitch(vec2 uv, float g) {
     if (g <= 0.001) return texture(u_scene, uv).rgb;
     float band_h = mix(0.02, 0.05, g);
@@ -115,8 +104,58 @@ vec3 apply_glitch(vec2 uv, float g) {
     return vec3(r, gr, b);
 }
 
+// Radial shockwave UV displacement. A ring of offset expands
+// outward from screen center. Pixels inside the ring get
+// pushed inward, pixels outside get pushed outward, giving
+// the classic bass-impact ripple.
+vec2 apply_shockwave(vec2 uv, float progress, float strength) {
+    if (progress <= 0.0 || strength <= 0.001) return uv;
+    vec2 c = uv - 0.5;
+    float d = length(c);
+    float front = progress * 0.85;
+    float band  = 0.10;
+    float env   = smoothstep(band, 0.0, abs(d - front));
+    float push  = sin((d - front) * 40.0) * env * 0.025 * strength
+                * (1.0 - progress);
+    if (d < 1e-4) return uv;
+    return uv + (c / d) * push;
+}
+
+// Sobel edge detector on luminance. Returns additive highlight
+// color for outlines. Samples the scene texture 8 times around
+// the target pixel.
+vec3 apply_outline(vec2 uv, float amount) {
+    if (amount <= 0.001) return vec3(0.0);
+    vec2 px = 1.0 / pc.resolution;
+    float tl = dot(texture(u_scene, uv + vec2(-px.x, -px.y)).rgb,
+                   vec3(0.2126, 0.7152, 0.0722));
+    float tc = dot(texture(u_scene, uv + vec2(  0.0, -px.y)).rgb,
+                   vec3(0.2126, 0.7152, 0.0722));
+    float tr = dot(texture(u_scene, uv + vec2( px.x, -px.y)).rgb,
+                   vec3(0.2126, 0.7152, 0.0722));
+    float ml = dot(texture(u_scene, uv + vec2(-px.x,   0.0)).rgb,
+                   vec3(0.2126, 0.7152, 0.0722));
+    float mr = dot(texture(u_scene, uv + vec2( px.x,   0.0)).rgb,
+                   vec3(0.2126, 0.7152, 0.0722));
+    float bl = dot(texture(u_scene, uv + vec2(-px.x,  px.y)).rgb,
+                   vec3(0.2126, 0.7152, 0.0722));
+    float bc = dot(texture(u_scene, uv + vec2(  0.0,  px.y)).rgb,
+                   vec3(0.2126, 0.7152, 0.0722));
+    float br = dot(texture(u_scene, uv + vec2( px.x,  px.y)).rgb,
+                   vec3(0.2126, 0.7152, 0.0722));
+    float gx = (tr + 2.0 * mr + br) - (tl + 2.0 * ml + bl);
+    float gy = (bl + 2.0 * bc + br) - (tl + 2.0 * tc + tr);
+    float mag = sqrt(gx * gx + gy * gy);
+    return vec3(mag) * amount * 1.8;
+}
+
 void main() {
     vec2 uv = v_uv;
+
+    // Shockwave displaces the UV used to sample the scene,
+    // which ripples the entire image including every other
+    // effect layered on top.
+    uv = apply_shockwave(uv, pc.shockwave_progress, pc.shockwave_strength);
 
     vec3 col;
     if (pc.glitch > 0.001) {
@@ -130,6 +169,14 @@ void main() {
     if (pc.bloom_intensity > 0.001) {
         vec3 bloom = gather_bloom(uv);
         col += bloom * pc.bloom_intensity * 1.2;
+    }
+
+    // Radial fog. near/far are normalized screen radii 0..1.
+    if (pc.fog_far > pc.fog_near + 1e-4) {
+        vec2 fc = uv - 0.5;
+        float fd = length(fc) * 2.0;
+        float fog = smoothstep(pc.fog_near, pc.fog_far, fd);
+        col *= 1.0 - fog * 0.85;
     }
 
     if (pc.vignette > 0.001) {
@@ -159,9 +206,27 @@ void main() {
         col = (col - 0.5) * 1.6 + 0.5;
     }
 
-    // Strobe: bright additive pulse on top of everything else.
     if (pc.strobe > 0.001) {
         col = mix(col, vec3(1.0), pc.strobe * 0.6);
+    }
+
+    // Outline: Sobel highlight added on top so it reads above
+    // bloom and color grading but below global inversions.
+    if (pc.outline_amount > 0.001) {
+        col += apply_outline(uv, pc.outline_amount);
+    }
+
+    // Grayscale mix. Applied before inversion so inverting a
+    // grayscale image still yields white on black.
+    if (pc.grayscale > 0.001) {
+        float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
+        col = mix(col, vec3(lum), pc.grayscale);
+    }
+
+    // Color inversion last. Linear interpolation so partial
+    // activations produce a crossfade rather than a hard flip.
+    if (pc.invert_colors > 0.001) {
+        col = mix(col, vec3(1.0) - col, pc.invert_colors);
     }
 
     {

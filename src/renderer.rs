@@ -54,6 +54,18 @@
 //! film grain / colorblind / high-contrast effects driven by
 //! [`crate::post::PostParams`]. The effect parameters are pushed
 //! once per frame through [`Renderer::set_post_params`].
+//!
+//! # SDF text stage
+//!
+//! On top of the main shape pipeline the renderer also owns a
+//! dedicated text pipeline ([`crate::font::TextStage`]) that
+//! samples a baked SDF atlas of the Exo 2 font. Text rendering
+//! happens inside the same offscreen render pass as the main
+//! shape draw, after the HUD shapes so glyphs overlay the rest
+//! of the scene. The text stage carries its own descriptor set
+//! and push constants and never interacts with the main
+//! pipeline state beyond rendering into the same color
+//! attachment in command order.
 
 use ash::{vk, Device, Entry, Instance};
 use std::ffi::{c_void, CString};
@@ -61,6 +73,7 @@ use std::time::{Duration, Instant};
 
 use crate::buffer::DynamicVertexBuffer;
 use crate::config::VsyncMode;
+use crate::font::{self, TextStage, TextVertex};
 use crate::pipeline::{Pipeline, PushConstants, Vertex};
 use crate::post::{PostParams, PostStage};
 
@@ -98,6 +111,13 @@ pub struct Renderer {
     /// `post.offscreen_render_pass()`.
     post: PostStage,
 
+    /// SDF text stage. Owns the font atlas image, descriptor
+    /// set, sampler, text pipeline, and per frame text vertex
+    /// buffers. Built against the same offscreen render pass
+    /// as the main pipeline so text quads and shape quads
+    /// share one render pass instance per frame.
+    text_stage: TextStage,
+
     command_pool:     vk::CommandPool,
     command_buffers:  Vec<vk::CommandBuffer>,
 
@@ -119,6 +139,31 @@ pub struct Renderer {
     shake_offset:     [f32; 2],
     post_params:      PostParams,
     zoom_scale:       f32,
+    /// Three-axis camera tilt in radians: `[angle, pitch, yaw]`.
+    /// Pushed to the vertex shader every frame. Zero means
+    /// no tilt on any axis and the shader's tilt path
+    /// collapses to identity.
+    tilt_rotation: [f32; 3],
+    /// Camera pitch in radians for the vertex shader. Positive
+    /// tilts the far edge of the play plane away from the viewer.
+    pitch:            f32,
+    /// Camera roll in radians for the vertex shader. Rotation
+    /// around the view axis, applied last in the view matrix.
+    roll:             f32,
+
+    /// Flag raised when the device was lost during either
+    /// queue submit or present. Polled by the main loop
+    /// through `take_device_lost` so shader quarantine and
+    /// graceful recovery can run above the renderer.
+    device_lost: bool,
+
+    /// Optional user shader pipeline to run in place of the
+    /// default post. When `Some`, the tuple carries the
+    /// pipeline object, its layout, and the push constant
+    /// bytes to push before the draw. The main loop sets
+    /// this via `set_user_post_pipeline` every frame that a
+    /// sandbox shader is active.
+    user_post: Option<(vk::Pipeline, vk::PipelineLayout, Vec<u8>)>,
 }
 
 impl Renderer {
@@ -220,6 +265,22 @@ impl Renderer {
             // We wire it to the offscreen render pass owned by PostStage.
             let pipeline = Pipeline::new(&device, post.offscreen_render_pass());
 
+            // SDF text stage. Built against the same offscreen render
+            // pass so text and shape draws can share one pass instance
+            // per frame, with per pipeline binds in between. The stage
+            // pulls the baked atlas pixels through the global
+            // `font::atlas()` accessor and uploads them via a one shot
+            // command buffer using the queue we just acquired.
+            let text_stage = TextStage::new(
+                &instance,
+                physical_device,
+                &device,
+                queue,
+                command_pool,
+                post.offscreen_render_pass(),
+                font::atlas(),
+            );
+
             // One persistently mapped vertex buffer per frame in flight,
             // so the CPU can write frame N+1 while the GPU consumes
             // frame N without any extra synchronization.
@@ -259,6 +320,7 @@ impl Renderer {
                 swapchain_extent,
                 swapchain_views,
                 post,
+                text_stage,
                 command_pool,
                 command_buffers,
                 pipeline,
@@ -271,7 +333,12 @@ impl Renderer {
                 vsync_dirty: false,
                 shake_offset: [0.0, 0.0],
                 zoom_scale:   1.0,
+                tilt_rotation: [0.0, 0.0, 0.0],
+                pitch:        0.0,
+                roll:         0.0,
                 post_params: PostParams::default(),
+                device_lost: false,
+                user_post: None,
             }
         }
     }
@@ -433,32 +500,37 @@ impl Renderer {
         self.vsync_dirty = false;
     }
 
-    /// Upload the supplied vertex list into this frame's vertex buffer
-    /// and submit one draw call covering the whole list.
-    ///
-    /// The vertex positions are expected to already be in Vulkan NDC,
-    /// produced under the assumption that the viewport covers a
-    /// centered square. The renderer enforces that assumption here by
-    /// programming a dynamic viewport plus scissor matching exactly
-    /// that square; everything outside is filled with the render pass
-    /// clear color (black) and serves as letterbox or pillarbox area.
-    pub fn render_frame(&mut self, vertices: &[Vertex]) {
+    /// Submit one frame. Game geometry rides the full push constant
+    /// set (zoom, shake, tilt, aspect). HUD geometry rides a
+    /// neutral variant where only the aspect scale is kept, so
+    /// overlays like the FPS counter, the pre-play banner, and any
+    /// future HUD element stay upright, unzoomed, and unshaken no
+    /// matter what the game is doing. SDF text geometry runs through
+    /// a separate text pipeline owned by `self.text_stage` and is
+    /// always rendered with neutral aspect scaling so glyphs stay
+    /// upright on every screen.
+    pub fn render_frame(
+        &mut self,
+        game_vertices: &[Vertex],
+        hud_vertices: &[Vertex],
+        text_vertices: &[TextVertex],
+    ) {
         if self.vsync_dirty {
             self.recreate_swapchain();
         }
 
         unsafe {
-            // Skip frames while the window is minimized to avoid
-            // allocating zero-sized swapchains on resize.
             if self.swapchain_extent.width == 0 || self.swapchain_extent.height == 0 {
                 return;
             }
 
             let frame = self.current_frame;
-            self.device.wait_for_fences(&[self.in_flight[frame]], true, u64::MAX).unwrap();
+            self.device.wait_for_fences(
+                &[self.in_flight[frame]], true, u64::MAX).unwrap();
 
             let acquire = self.swapchain_loader.acquire_next_image(
-                self.swapchain, u64::MAX, self.image_available[frame], vk::Fence::null());
+                self.swapchain, u64::MAX,
+                self.image_available[frame], vk::Fence::null());
             let image_index = match acquire {
                 Ok((idx, _)) => idx,
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
@@ -470,33 +542,29 @@ impl Renderer {
 
             self.device.reset_fences(&[self.in_flight[frame]]).unwrap();
 
-            // Safe to write because the fence above guarantees the GPU
-            // is done reading the previous contents of this same buffer.
-            self.vertex_buffers[frame].upload(vertices);
-            let vertex_count = self.vertex_buffers[frame].count as u32;
+            // Upload game and HUD vertices into one buffer so both
+            // draw calls bind the same buffer and only differ in
+            // their firstVertex / vertexCount parameters.
+            self.vertex_buffers[frame].upload_two(
+                game_vertices, hud_vertices);
+            let total_count = self.vertex_buffers[frame].count as u32;
+            let game_count = (game_vertices.len() as u32).min(total_count);
+            let hud_count = total_count - game_count;
 
             let cmd = self.command_buffers[frame];
-            self.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).unwrap();
+            self.device.reset_command_buffer(
+                cmd, vk::CommandBufferResetFlags::empty()).unwrap();
 
             let begin = vk::CommandBufferBeginInfo::default();
             self.device.begin_command_buffer(cmd, &begin).unwrap();
 
-            // ---- pass 1: main scene into the offscreen target ----
-
             self.post.begin_offscreen(&self.device, cmd, self.swapchain_extent);
 
-            // Full screen viewport plus matching scissor. We no
-            // longer carve out a centered square: the pipeline's
-            // vertex shader applies a `vec2 scale` push constant
-            // that takes care of aspect correction without losing
-            // any pixels to letterboxing.
             let viewport = vk::Viewport {
-                x:         0.0,
-                y:         0.0,
-                width:     self.swapchain_extent.width  as f32,
-                height:    self.swapchain_extent.height as f32,
-                min_depth: 0.0,
-                max_depth: 1.0,
+                x: 0.0, y: 0.0,
+                width:  self.swapchain_extent.width  as f32,
+                height: self.swapchain_extent.height as f32,
+                min_depth: 0.0, max_depth: 1.0,
             };
             let scissor = vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
@@ -505,53 +573,99 @@ impl Renderer {
             self.device.cmd_set_viewport(cmd, 0, &[viewport]);
             self.device.cmd_set_scissor (cmd, 0, &[scissor]);
 
-            // Push the aspect scale + shake offset to the vertex
-            // shader. 16 bytes total; sent as a raw byte slice.
-            let (sx, sy) = aspect_scale(self.swapchain_extent.width,
-                                        self.swapchain_extent.height);
-            let pc = PushConstants {
-                scale: [sx, sy],
-                shake: self.shake_offset,
-                zoom:  self.zoom_scale,
-                _pad:  [0.0, 0.0, 0.0],
-            };
-            let push_bytes = std::slice::from_raw_parts(
-                (&pc as *const PushConstants) as *const u8,
-                std::mem::size_of::<PushConstants>(),
-            );
-            self.device.cmd_push_constants(
-                cmd,
-                self.pipeline.layout,
-                vk::ShaderStageFlags::VERTEX,
-                0,
-                push_bytes,
-            );
+            let (sx, sy) = aspect_scale(
+                self.swapchain_extent.width,
+                self.swapchain_extent.height);
 
-            // Bind once, draw the entire triangle list. With no index
-            // buffer and no instancing this is the minimum amount of
-            // command stream needed to put pixels on screen.
-            if vertex_count > 0 {
+            if total_count > 0 {
                 self.device.cmd_bind_pipeline(
                     cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline.pipeline);
                 self.device.cmd_bind_vertex_buffers(
                     cmd, 0, &[self.vertex_buffers[frame].buffer], &[0]);
-                self.device.cmd_draw(cmd, vertex_count, 1, 0, 0);
             }
+
+            // Game pass: full push constants driven by game state.
+            if game_count > 0 {
+                let pc_game = PushConstants {
+                    scale:      [sx, sy],
+                    shake:      self.shake_offset,
+                    zoom:       self.zoom_scale,
+                    tilt_angle: self.tilt_rotation[0],
+                    tilt_pitch: self.tilt_rotation[1],
+                    tilt_yaw:   self.tilt_rotation[2],
+                };
+                let push_bytes = std::slice::from_raw_parts(
+                    (&pc_game as *const PushConstants) as *const u8,
+                    std::mem::size_of::<PushConstants>(),
+                );
+                self.device.cmd_push_constants(
+                    cmd,
+                    self.pipeline.layout,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    push_bytes,
+                );
+                self.device.cmd_draw(cmd, game_count, 1, 0, 0);
+            }
+
+            // HUD pass: neutral push constants. Only aspect scale
+            // is preserved so HUD positions stay anchored to the
+            // real screen edges on any window ratio. Every other
+            // camera effect collapses to identity.
+            if hud_count > 0 {
+                let pc_hud = PushConstants {
+                    scale:      [sx, sy],
+                    shake:      [0.0, 0.0],
+                    zoom:       1.0,
+                    tilt_angle: 0.0,
+                    tilt_pitch: 0.0,
+                    tilt_yaw:   0.0,
+                };
+                let push_bytes = std::slice::from_raw_parts(
+                    (&pc_hud as *const PushConstants) as *const u8,
+                    std::mem::size_of::<PushConstants>(),
+                );
+                self.device.cmd_push_constants(
+                    cmd,
+                    self.pipeline.layout,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    push_bytes,
+                );
+                self.device.cmd_draw(cmd, hud_count, 1, game_count, 0);
+            }
+
+            // SDF text on top of shapes. The text stage swaps in
+            // its own pipeline, descriptor set, vertex buffer and
+            // push constant block, then draws once and returns.
+            // Viewport and scissor were set above and stay valid
+            // through the pipeline switch because both pipelines
+            // declare them as dynamic state.
+            self.text_stage.render(
+                &self.device, cmd, text_vertices, [sx, sy]);
 
             self.post.end_render_pass(&self.device, cmd);
 
-            // ---- pass 2: post process into the swapchain ----
-
-            // The resolution field is filled per frame because the
-            // window can resize between calls.
-            let mut params = self.post_params;
-            params.resolution = [
-                self.swapchain_extent.width  as f32,
-                self.swapchain_extent.height as f32,
-            ];
-            self.post.render_post(
-                &self.device, cmd, image_index,
-                self.swapchain_extent, &params);
+            // Post process pass. When a user shader is
+            // installed through set_user_post_pipeline we run
+            // it through the same render pass the default
+            // post uses; otherwise fall back to the built in
+            // pipeline driven by PostParams.
+            if let Some((pipe, layout, ref push)) = self.user_post {
+                self.post.render_post_with_pipeline(
+                    &self.device, cmd, image_index,
+                    self.swapchain_extent,
+                    pipe, layout, push.as_slice());
+            } else {
+                let mut params = self.post_params;
+                params.resolution = [
+                    self.swapchain_extent.width  as f32,
+                    self.swapchain_extent.height as f32,
+                ];
+                self.post.render_post(
+                    &self.device, cmd, image_index,
+                    self.swapchain_extent, &params);
+            }
 
             self.device.end_command_buffer(cmd).unwrap();
 
@@ -565,7 +679,23 @@ impl Renderer {
                 .wait_dst_stage_mask(&wait_stages)
                 .command_buffers(&cmd_bufs)
                 .signal_semaphores(&signal_sems);
-            self.device.queue_submit(self.queue, &[submit], self.in_flight[frame]).unwrap();
+            // Submit and present. Device lost is a soft
+            // failure: we surface it through `device_lost`
+            // and let the main loop decide whether to
+            // quarantine the active user shader and attempt
+            // recovery. Every other error is still fatal.
+            match self.device.queue_submit(
+                self.queue, &[submit], self.in_flight[frame])
+            {
+                Ok(()) => {}
+                Err(vk::Result::ERROR_DEVICE_LOST) => {
+                    self.device_lost = true;
+                    self.current_frame =
+                        (self.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
+                    return;
+                }
+                Err(e) => panic!("queue_submit: {:?}", e),
+            }
 
             let swapchains = [self.swapchain];
             let indices    = [image_index];
@@ -579,11 +709,75 @@ impl Renderer {
                 | Err(vk::Result::SUBOPTIMAL_KHR) => {
                     self.recreate_swapchain();
                 }
+                Err(vk::Result::ERROR_DEVICE_LOST) => {
+                    self.device_lost = true;
+                }
                 Err(e) => panic!("queue_present: {:?}", e),
             }
 
             self.current_frame = (self.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
         }
+    }
+
+    /// Take the device lost flag and clear it. Returns true
+    /// when the previous frame reported VK_ERROR_DEVICE_LOST
+    /// during submit or present. The main loop forwards this
+    /// to the shader sandbox so the active user shader (if
+    /// any) can be added to the persistent quarantine list.
+    pub fn take_device_lost(&mut self) -> bool {
+        let v = self.device_lost;
+        self.device_lost = false;
+        v
+    }
+
+    /// Borrow the Vulkan logical device. Exposed so code that
+    /// owns objects whose destruction is driven from outside
+    /// the renderer (user shader pipelines, offline bench
+    /// resources) can call the raw destroy functions without
+    /// the renderer having to mediate every single type.
+    pub fn device_ref(&self) -> &ash::Device {
+        &self.device
+    }
+
+    /// Borrow the Vulkan instance. Needed by the shader
+    /// sandbox to build pipelines that live alongside the
+    /// engine's own.
+    pub fn instance_ref(&self) -> &ash::Instance {
+        &self.instance
+    }
+
+    /// Physical device the renderer is bound to. Also used
+    /// by the shader sandbox for memory queries on benchmark
+    /// resources.
+    pub fn physical_device(&self) -> ash::vk::PhysicalDevice {
+        self.physical_device
+    }
+
+    /// Install or clear the user post pipeline. When set, the
+    /// renderer runs the supplied pipeline inside the post
+    /// render pass instead of the engine's own `post.frag`.
+    /// Passing `None` restores the default pipeline for the
+    /// next frame.
+    pub fn set_user_post_pipeline(
+        &mut self,
+        pipeline: Option<(vk::Pipeline, vk::PipelineLayout, Vec<u8>)>,
+    ) {
+        self.user_post = pipeline;
+    }
+
+    /// Render pass the post pipeline is built against. The
+    /// shader sandbox needs this to compile user pipelines
+    /// compatible with the swapchain framebuffers.
+    pub fn post_render_pass(&self) -> vk::RenderPass {
+        self.post.post_render_pass()
+    }
+
+    /// Descriptor set layout the post stage uses. The sandbox
+    /// builds user pipelines against this layout so the
+    /// descriptor set bound by `PostStage` covers both the
+    /// default and any user pipeline without a rebind.
+    pub fn post_descriptor_set_layout(&self) -> vk::DescriptorSetLayout {
+        self.post.descriptor_set_layout()
     }
 
     /// Release every Vulkan object in reverse order of creation.
@@ -598,6 +792,12 @@ impl Renderer {
                 vb.destroy(&self.device);
             }
             self.pipeline.destroy(&self.device);
+
+            // Text stage owns its own image, descriptor pool,
+            // pipeline, sampler, and per frame vertex buffers.
+            // Destroy it before PostStage because it depends on
+            // the offscreen render pass PostStage owns.
+            self.text_stage.destroy(&self.device);
 
             for i in 0..MAX_FRAMES_IN_FLIGHT {
                 self.device.destroy_semaphore(self.image_available[i], None);
@@ -619,6 +819,33 @@ impl Renderer {
         }
     }
 
+    /// Set the camera tilt state for the next frame. `pitch` and
+    /// `roll` are in radians. The `_persp` parameter is kept for
+    /// API compatibility with earlier revisions but no longer
+    /// carried into the shader: perspective is now always applied
+    /// through the view-projection matrix. Menus and the editor
+    /// pass pitch = roll = 0, which degenerates the matrix to the
+    /// legacy 2D mapping, so the UI still renders flat.
+    ///
+    /// Values are clamped to a conservative envelope. The
+    /// generator's own MAX_TILT_DEG (15 deg = 0.26 rad) already
+    /// keeps DSL-driven values well inside this, the extra margin
+    /// tolerates future triggers that might push harder for epic
+    /// moments without risking a wraparound view.
+    pub fn set_camera_tilt(&mut self, pitch: f32, roll: f32, _persp: f32) {
+        let limit = 0.55;
+        self.pitch = pitch.clamp(-limit, limit);
+        self.roll  = roll.clamp(-limit, limit);
+    }
+
+    /// Set camera tilt in radians. Components are
+    /// `[angle (Z-roll), pitch (X), yaw (Y)]`. Persistent
+    /// across frames until overwritten, matching how
+    /// `set_shake` and `set_zoom` behave.
+    pub fn set_tilt(&mut self, t: [f32; 3]) {
+        self.tilt_rotation = t;
+    }
+    
     /// Uniform camera zoom applied in the vertex shader before
     /// aspect correction. Values above 1.0 zoom in.
     pub fn set_zoom(&mut self, z: f32) {
@@ -702,4 +929,140 @@ impl FramePacer {
             std::hint::spin_loop();
         }
     }
+}
+
+/// Build the view-projection matrix for the frame. Column-major
+/// storage matching GLSL's mat4 layout.
+///
+/// Inputs:
+/// * `w`, `h`: swapchain extent in pixels, feeds the aspect
+///   ratio into the projection.
+/// * `pitch`: camera pitch in radians. Positive tilts the far
+///   edge of the play plane away from the viewer.
+/// * `roll`:  camera roll around the view axis in radians.
+///
+/// Output is a 16-element array where elements 0..4 are column
+/// 0, 4..8 are column 1, and so on.
+///
+/// Construction, right-to-left as the matrices multiply a world
+/// point:
+///
+///     clip = P * Rz(roll) * T(0, 0, cam_dist) * Rx(-pitch) * world
+///
+/// Intuition:
+/// * `Rx(-pitch)` rotates the scene around the world X axis so
+///   that a positive pitch sends the top of the original ortho
+///   view (y < 0, screen top in Y-down) to positive eye z,
+///   i.e. farther from the camera. After the perspective divide
+///   this makes the top smaller, exactly the OH look.
+/// * `T(0, 0, cam_dist)` translates the rotated scene into the
+///   camera frustum. Scene center lands at eye (0, 0, cam_dist),
+///   directly in front of the camera.
+/// * `Rz(roll)` is a screen-space rotation applied last. Kept
+///   in the chain for future epic moments even though gameplay
+///   currently passes roll = 0.
+/// * `P` is a custom perspective matrix whose X / Y scales are
+///   `cam_dist * sx_2d` and `cam_dist * sy_2d` respectively,
+///   where `(sx_2d, sy_2d)` come from `aspect_scale`. At the
+///   plane z = cam_dist this reproduces the legacy ortho
+///   mapping exactly; off-plane points foreshorten normally
+///   through the w-divide.
+fn build_view_proj(w: u32, h: u32, pitch: f32, roll: f32) -> [f32; 16] {
+    // Camera distance. 4.0 is chosen so that at the renderer's
+    // clamp limits (|pitch| <= 0.55, scene radius <= 5 for the
+    // background) no point lands behind the near plane even
+    // with a modest author zoom applied upstream. Larger values
+    // flatten perspective; smaller values exaggerate it.
+    const CAM_DIST: f32 = 4.0;
+    // Near and far planes of the perspective frustum. The safe
+    // envelope noted above keeps z_eye comfortably inside
+    // [0.1, 100] for every realistic frame.
+    const NEAR: f32 = 0.1;
+    const FAR:  f32 = 100.0;
+
+    let (sx_2d, sy_2d) = aspect_scale(w, h);
+
+    let rx = mat4_rotation_x(-pitch);
+    let t  = mat4_translation(0.0, 0.0, CAM_DIST);
+    let rz = mat4_rotation_z(roll);
+
+    // View = Rz * T * Rx(-pitch). T and Rz commute here because
+    // T is pure along Z and Rz fixes Z, so the explicit Rz at
+    // the end is just a readability choice: roll reads as a
+    // screen-space effect, applied last.
+    let v_inner = mat4_mul(&t, &rx);
+    let v       = mat4_mul(&rz, &v_inner);
+
+    // Custom perspective projection. Rather than the textbook
+    // (fov_y, aspect) form, we use (CAM_DIST * sx_2d) for the
+    // X scale and (CAM_DIST * sy_2d) for the Y scale. This
+    // recovers the legacy aspect_scale behavior at pitch = 0
+    // (longer axis unity, shorter axis squeezed), while the
+    // w-divide still foreshortens pitched points.
+    let sx = CAM_DIST * sx_2d;
+    let sy = CAM_DIST * sy_2d;
+    let c  = FAR / (FAR - NEAR);
+    let d  = -FAR * NEAR / (FAR - NEAR);
+    let p: [f32; 16] = [
+         sx, 0.0, 0.0, 0.0,
+        0.0,  sy, 0.0, 0.0,
+        0.0, 0.0,   c, 1.0,
+        0.0, 0.0,   d, 0.0,
+    ];
+
+    mat4_mul(&p, &v)
+}
+
+/// Multiply two 4x4 matrices in column-major storage. Result
+/// element `(col, row)` lives at index `col * 4 + row`, matching
+/// GLSL's mat4 layout.
+fn mat4_mul(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
+    let mut out = [0.0f32; 16];
+    for col in 0..4 {
+        for row in 0..4 {
+            let mut s = 0.0;
+            for k in 0..4 {
+                s += a[k * 4 + row] * b[col * 4 + k];
+            }
+            out[col * 4 + row] = s;
+        }
+    }
+    out
+}
+
+/// Pure translation matrix, column-major.
+fn mat4_translation(x: f32, y: f32, z: f32) -> [f32; 16] {
+    [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        x,   y,   z,   1.0,
+    ]
+}
+
+/// Rotation around the X axis by `angle` radians, column-major.
+/// Standard right-handed convention: rotates +Y toward +Z for
+/// positive angles.
+fn mat4_rotation_x(angle: f32) -> [f32; 16] {
+    let c = angle.cos();
+    let s = angle.sin();
+    [
+        1.0, 0.0, 0.0, 0.0,
+        0.0,   c,   s, 0.0,
+        0.0,  -s,   c, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ]
+}
+
+/// Rotation around the Z axis by `angle` radians, column-major.
+/// Rotates +X toward +Y for positive angles.
+fn mat4_rotation_z(angle: f32) -> [f32; 16] {
+    let c = angle.cos();
+    let s = angle.sin();
+    [
+          c,   s, 0.0, 0.0,
+         -s,   c, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ]
 }

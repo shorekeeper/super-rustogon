@@ -34,6 +34,7 @@
 
 use crate::levels::Palette;
 use crate::levels::difficulty::Tier;
+use crate::dsl::rules::{LevelRules, RuleCategory, RuleSet};
 
 /// Top level syntactic unit corresponding to one `.rlf` file.
 #[derive(Clone, Debug)]
@@ -51,11 +52,27 @@ pub struct LevelAst {
     /// once parsing finishes.
     pub sections:         Vec<Section>,
     /// Debug helper populated by the `#[startfrom]` directive.
-    /// Main loop seeks the music to this many seconds the
-    /// moment the level starts, so authors can iterate on a
-    /// specific drop without waiting through the whole song.
-    /// `0.0` means "start from the top".
     pub start_from_seconds: f32,
+    /// Debug directive: when `true`, the simulation never
+    /// kills the player on collision. Close-call detection,
+    /// particles, shake and all other "you almost died"
+    /// visuals still fire, but the run does not end. Intended
+    /// for authoring sessions where the author wants to scrub
+    /// through their level without dying on every mistake.
+    ///
+    /// Toggled by the `#[ignore_collisions]` file directive.
+    /// Defaults to `false` so every normal level plays the
+    /// same way it always did.
+    pub ignore_collisions: bool,
+    /// Baseline gameplay rules declared at file level via
+    /// `#[ability ...]`, `#[vision ...]`, etc. Section level
+    /// `rule` statements stack on top of these; `revert` inside
+    /// a section returns to the values stored here.
+    pub rules: LevelRules,
+    /// User post shader declarations, in source order. A
+    /// `PostShader` trigger references one of these entries
+    /// by index.
+    pub shaders: Vec<ShaderDecl>,
 }
 
 impl Default for LevelAst {
@@ -69,6 +86,9 @@ impl Default for LevelAst {
             globals:            Vec::new(),
             sections:           Vec::new(),
             start_from_seconds: 0.0,
+            ignore_collisions: false,
+            rules:              LevelRules::default(),
+            shaders:            Vec::new(),
         }
     }
 }
@@ -215,16 +235,26 @@ pub enum Stmt {
     Emit    (ObstacleSpec),
     Wait    (u32),
     Trigger (TriggerSpec),
-    /// Repeat `body` exactly `count` times in order. Any
-    /// `LocalVars` declared inside are re-initialized for each
-    /// iteration, matching the usual meaning of a "for i in
-    /// 1..=count" loop.
+    /// Repeat `body` exactly `count` times in order.
     Repeat  { count: u32, body: Vec<Stmt> },
     /// Push a variable scope that lives until the enclosing
-    /// `{ ... }` body ends, then unwinds automatically. Bindings
-    /// shadow any global with the same name for the duration of
-    /// the scope.
+    /// `{ ... }` body ends.
     LocalVars (Vec<VarDecl>),
+    /// Apply a rule set in place, overwriting the matching
+    /// category's current state with the fields this rule
+    /// contains. Fields left at `None` keep their prior value.
+    Rule(RuleSet),
+    /// Revert one category (or all of them) to the file level
+    /// baseline stored in `LevelAst::rules`. Clears any pushed
+    /// snapshots along the way.
+    Revert(RuleCategory),
+    /// Save the current state of one category onto its stack.
+    /// A later `Pop(same_category)` restores exactly this
+    /// state, regardless of intervening `rule` statements.
+    Push(RuleCategory),
+    /// Restore the most recently pushed state for one
+    /// category. No-op when the stack is empty.
+    Pop(RuleCategory),
 }
 
 /// Spinning direction for patterns that walk around the ring.
@@ -295,6 +325,17 @@ pub struct Formula {
     pub program: crate::dsl::formula::Expr,
 }
 
+/// One declaration of a user post-process shader in a level.
+/// The body source lives in a separate file; the AST carries
+/// only the name and the path. The main loop hands the path
+/// to the shader sandbox at runtime when a `PostShader`
+/// trigger activates this slot.
+#[derive(Clone, Debug)]
+pub struct ShaderDecl {
+    pub name: String,
+    pub path: String,
+}
+
 /// Every obstacle pattern the DSL can spawn. Each variant is
 /// guaranteed by the generator to leave at least one reachable
 /// gap per step; structural invariants are checked once at
@@ -336,44 +377,210 @@ pub enum ObstacleSpec {
     },
 }
 
-/// Trigger family. "Simple" triggers (Flip, Tilt, etc.) keep
-/// their v1 single-argument form for brevity; the richer
-/// triggers take a struct style field block in the DSL.
+/// Trigger family. Every trigger variant now carries a
+/// `duration` so the simulation can return to neutral state
+/// automatically once the authored time window elapses. The
+/// older variants that did not have a duration (`Tilt`,
+/// `SpeedMult`, `HueShift`) gain the field too; legacy parser
+/// paths that do not specify it fall back to reasonable
+/// defaults documented at the parser level.
+///
+/// `SpeedWarp` axes are now `Option<f32>`: `None` means "do
+/// not touch this axis", `Some(0.0)` means "force this axis
+/// to zero", and any positive value is the target multiplier.
+/// This resolves the long standing ambiguity where `0.0`
+/// meant both "neutral" and "halt".
+///
+/// All variants are still `Copy` because `Option<f32>` is
+/// `Copy` whenever its payload is. This preserves the zero
+/// cost pass by value semantics the rest of the engine relies
+/// on.
 #[derive(Clone, Copy, Debug)]
 pub enum TriggerSpec {
+    /// Instantaneous camera flip. No duration because the flip
+    /// itself is a discrete event; the camera simply reverses
+    /// direction and keeps spinning.
     Flip,
-    Tilt(f32),
+
+    /// Short background pulse. The visual duration is hard
+    /// coded on the generator side (see `PULSE_DURATION`) so
+    /// this variant stays parameter-less.
     Pulse,
-    SpeedMult(f32),
-    HueShift(f32),
+
+    /// Camera tilt on up to three axes.
+    ///
+    /// `angle` is the Z-axis roll (plain 2D rotation of the
+    /// screen). `pitch` tilts the scene forward / backward as
+    /// if viewed from above at an angle. `yaw` tilts it
+    /// sideways. All three are in degrees and clamped by the
+    /// parser to `±30`.
+    ///
+    /// `duration` is `Option<f32>`:
+    ///
+    /// * `None` means the tilt holds indefinitely (sticky).
+    ///   Another `Tilt` trigger can override it, otherwise it
+    ///   persists until the level ends. This matches legacy
+    ///   pre-perspective behaviour.
+    /// * `Some(seconds)` makes the tilt self-cancel.
+    ///
+    /// Perspective is applied globally inside the vertex
+    /// shader, so a tilted frame skews the entire display,
+    /// including HUD overlays and editor UI drawn through the
+    /// same pipeline. This is intentional and gives `:tilt` a
+    /// visible, unmistakable effect even on a spinning
+    /// camera where a pure Z-roll would be swallowed by the
+    /// ongoing rotation.
+    Tilt {
+        angle:    f32,
+        pitch:    f32,
+        yaw:      f32,
+        duration: Option<f32>,
+    },
+
+    /// Multiply wall travel speed by `factor` for `duration`
+    /// seconds. Historically `duration` was a fixed constant
+    /// inside the generator; exposing it here lets authors
+    /// decide how long a burst lasts.
+    SpeedMult { factor: f32, duration: f32 },
+
+    /// Drift the palette hue at `rate` radians per second for
+    /// `duration` seconds. Same rationale as `SpeedMult` for
+    /// the new explicit duration field.
+    HueShift { rate: f32, duration: f32 },
 
     /// Multiply wall / rotation / cursor / music speed
-    /// independently for `duration` seconds. A zero entry means
-    /// "do not touch this axis".
+    /// independently for `duration` seconds. Each axis is
+    /// `Option`:
+    ///
+    /// * `None` leaves that channel untouched, so a pipe like
+    ///   `:speedwarp { walls = 1.5 } |> :speedwarp { rotation
+    ///   = 1.2 }` independently scales walls and rotation.
+    /// * `Some(0.0)` is a legitimate "halt this axis" request,
+    ///   which the old schema could not express.
+    /// * `Some(v)` for any other `v` is the target multiplier.
+    ///
+    /// The generator maintains a separate timer per axis so
+    /// axes stacked from several piped triggers each respect
+    /// their own duration rather than having the latest
+    /// duration overwrite the earlier one.
     SpeedWarp {
-        walls:       f32,
-        rotation:    f32,
-        cursor:      f32,
-        music_scale: f32,
+        walls:       Option<f32>,
+        rotation:    Option<f32>,
+        cursor:      Option<f32>,
+        music_scale: Option<f32>,
         duration:    f32,
     },
+
     /// Engage the post-process glitch effect. `strength` in
     /// 0..1 sets the magnitude; `duration` in seconds sets the
     /// tail.
     Glitch { strength: f32, duration: f32 },
-    /// Hard screen shake. Stacks additively with `Glitch` and
-    /// with the ambient close-call trauma.
+
+    /// Hard screen shake. Stacks with other shake requests
+    /// using a "maximum wins" policy in the generator, so back
+    /// to back `:shake` triggers reinforce each other rather
+    /// than cancel each other out.
     Shake  { strength: f32, duration: f32 },
+
     /// Animated camera zoom. `target` is the final scale
     /// (1.0 is neutral). Eases over `duration` seconds using
     /// the named easing.
     Zoom   { target: f32, anim: Anim, duration: f32 },
+
     /// Invert the left / right cursor input for `duration`
     /// seconds. The screen tint hints at the active state so
     /// the player is not just confused.
     Invert { duration: f32 },
+
     /// Periodic bright flash at `rate` Hz for `duration`
     /// seconds. Useful for BPM synchronized bridges; `rate 0`
     /// means "pulse once".
     Strobe { rate: f32, duration: f32 },
+
+    /// Continuous camera spin added to the gameplay camera
+    /// rotation. `rate` is radians per second (positive is CW
+    /// in game coords). Stops cleanly when the timer elapses.
+    Spin { rate: f32, duration: f32 },
+
+    /// Per onset trauma bounce. While active, every detected
+    /// audio onset injects `amplitude` of trauma into the screen
+    /// shake accumulator. Gives JSAB style beat impact without
+    /// requiring a shake trigger on every beat.
+    Bounce { amplitude: f32, duration: f32 },
+
+    /// Freeze wall motion for `duration` seconds. Input, audio
+    /// and camera keep moving; only the radial wall velocity is
+    /// held at zero. Great for breath moments before drops.
+    Freeze { duration: f32 },
+
+    /// Animated zoom punch. Ramps zoom up by `strength` over
+    /// the first half of `duration` and back to neutral over
+    /// the second half. Distinct from `Zoom` because it is a
+    /// one shot impulse with a built in ease; authors do not
+    /// have to schedule a return zoom.
+    ZoomPunch { strength: f32, duration: f32 },
+
+    /// Invert the final framebuffer colors for `duration`
+    /// seconds. Separate from `Invert` which swaps input.
+    InvertColors { duration: f32 },
+
+    /// Desaturate the final framebuffer. `strength` in 0..1,
+    /// 1.0 is full grayscale.
+    Grayscale { strength: f32, duration: f32 },
+
+    /// Radial shockwave displacement. A ring of pixel offsets
+    /// expands from screen center over the duration, giving a
+    /// recognizable punch effect on drops.
+    Shockwave { strength: f32, duration: f32 },
+
+    /// Radial fog. `near` and `far` are normalized screen
+    /// radii 0..1. Pixels beyond `far` fade toward black while
+    /// pixels inside `near` stay untouched.
+    Fog { near: f32, far: f32, duration: f32 },
+
+    /// Sobel style edge outlining across the whole image.
+    /// `thickness` scales the additive contribution.
+    Outline { thickness: f32, duration: f32 },
+
+    /// Particle explosion out of the playfield center.
+    /// `strength` scales count and speed. Fires once per
+    /// trigger regardless of duration; duration is reserved
+    /// for future extensions that might sustain the effect.
+    Centerburst { strength: f32, duration: f32 },
+
+    /// Series of expanding pulse rings. Rings are spaced
+    /// evenly across `duration`. Reads as a multi wave
+    /// emanation from the center.
+    Ringburst { count: u32, duration: f32 },
+
+    /// Composite impact trigger. Fires zoom punch, shake,
+    /// shockwave and a brief flash at once. Single authored
+    /// call per drop, full JSAB bass drop aesthetic.
+    Bassdrop { strength: f32, duration: f32 },
+
+    /// Activate a user supplied post process shader declared
+    /// in the level's `shader` block. `slot` is the index
+    /// into `LevelAst::shaders`; values outside that range
+    /// are a no op at runtime. `p` carries up to four scalar
+    /// parameters that the shader receives through its push
+    /// constant block in declaration order.
+    PostShader { slot: u8, p: [f32; 4] },
+
+    /// Revert the post pipeline to the engine's built in
+    /// shader. Paired with `PostShader`. Equivalent to
+    /// issuing `PostShader` with a slot whose shader file is
+    /// the default, but cheaper and explicit.
+    PostShaderOff,
+
+    /// Morph the playfield's polygon shape to `sides` over
+    /// `duration` seconds. Integer target in 3..=12 clamped
+    /// at parse time.
+    ///
+    /// Walls already in flight keep the angular positions they
+    /// were spawned with, so a morph never teleports existing
+    /// threats into new lanes. Newly spawned walls use the
+    /// target `sides` immediately, so the slot count available
+    /// to the generator updates at the instant the trigger
+    /// fires, not at the end of the visual ease.
+    Morph { sides: u32, duration: f32 },
 }

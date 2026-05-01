@@ -73,6 +73,7 @@ pub const WM_KEYUP:       UINT = 0x0101;
 pub const WM_MOUSEMOVE:   UINT = 0x0200;
 pub const WM_LBUTTONDOWN: UINT = 0x0201;
 pub const WM_LBUTTONUP:   UINT = 0x0202;
+pub const WM_MOUSEWHEEL:  UINT = 0x020A;
 
 pub const VK_ESCAPE: WPARAM = 0x1B;
 pub const VK_LEFT:   WPARAM = 0x25;
@@ -84,6 +85,8 @@ pub const VK_RETURN: WPARAM = 0x0D;
 pub const VK_SHIFT:  WPARAM = 0x10;
 pub const VK_LSHIFT: WPARAM = 0xA0;
 pub const VK_RSHIFT: WPARAM = 0xA1;
+
+pub const VK_DELETE: WPARAM = 0x2E;
 
 pub const IDC_ARROW: LPCWSTR = 32512usize as LPCWSTR;
 
@@ -131,6 +134,16 @@ static MOUSE_X: AtomicI32 = AtomicI32::new(0);
 static MOUSE_Y: AtomicI32 = AtomicI32::new(0);
 static MOUSE_LEFT: AtomicBool = AtomicBool::new(false);
 
+/// Accumulated mouse wheel delta since the last `take_scroll_delta`
+/// call. Positive values are scroll up / away from the user,
+/// negative are scroll down / toward the user. Integer units of
+/// WHEEL_DELTA = 120 on a typical PC mouse; callers divide by 120
+/// to get notch counts.
+static SCROLL_DELTA: AtomicI32 = AtomicI32::new(0);
+
+/// Is the Delete key currently down?
+static KEY_DELETE:  AtomicBool = AtomicBool::new(false);
+
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Input {
     pub left:   bool,
@@ -141,6 +154,7 @@ pub struct Input {
     pub enter:  bool,
     pub escape: bool,
     pub shift:  bool,
+    pub delete: bool,
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -165,6 +179,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, w: WPARAM, l: LPARAM) 
                 VK_DOWN   => KEY_DOWN.store(true, Ordering::SeqCst),
                 VK_SPACE  => KEY_SPACE.store(true, Ordering::SeqCst),
                 VK_RETURN => KEY_ENTER.store(true, Ordering::SeqCst),
+                VK_DELETE => KEY_DELETE.store(true, Ordering::SeqCst),
                 VK_SHIFT | VK_LSHIFT | VK_RSHIFT
                           => KEY_SHIFT.store(true, Ordering::SeqCst),
                 _ => {}
@@ -180,6 +195,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, w: WPARAM, l: LPARAM) 
                 VK_DOWN   => KEY_DOWN.store(false, Ordering::SeqCst),
                 VK_SPACE  => KEY_SPACE.store(false, Ordering::SeqCst),
                 VK_RETURN => KEY_ENTER.store(false, Ordering::SeqCst),
+                VK_DELETE => KEY_DELETE.store(false, Ordering::SeqCst),
                 VK_SHIFT | VK_LSHIFT | VK_RSHIFT
                           => KEY_SHIFT.store(false, Ordering::SeqCst),
                 _ => {}
@@ -195,6 +211,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, w: WPARAM, l: LPARAM) 
         }
         WM_LBUTTONDOWN => { MOUSE_LEFT.store(true, Ordering::SeqCst); 0 }
         WM_LBUTTONUP   => { MOUSE_LEFT.store(false, Ordering::SeqCst); 0 }
+        WM_MOUSEWHEEL => {
+            // WM_MOUSEWHEEL packs the delta into the high word of
+            // wparam as a signed 16 bit value. Unpack explicitly
+            // so a downward notch (negative delta) stays negative
+            // when cast back to i32.
+            let raw = ((w >> 16) & 0xFFFF) as u16;
+            let delta = raw as i16 as i32;
+            SCROLL_DELTA.fetch_add(delta, Ordering::SeqCst);
+            0
+        }
         WM_SIZE => {
             let nw = (l & 0xFFFF) as i32;
             let nh = ((l >> 16) & 0xFFFF) as i32;
@@ -285,6 +311,7 @@ impl Window {
             enter:  KEY_ENTER.load (Ordering::SeqCst),
             escape: KEY_ESCAPE.load(Ordering::SeqCst),
             shift:  KEY_SHIFT.load (Ordering::SeqCst),
+            delete: KEY_DELETE.load(Ordering::SeqCst),
         }
     }
 
@@ -295,4 +322,13 @@ impl Window {
             left_down: MOUSE_LEFT.load(Ordering::SeqCst),
         }
     }
+
+    /// Pull the accumulated mouse wheel delta since the last
+    /// call. Units are raw WHEEL_DELTA (120 per notch). The
+    /// editor divides by 120 to convert to clean integer notch
+    /// counts for canvas zoom and scroll lists.
+    pub fn take_scroll_delta(&self) -> i32 {
+        SCROLL_DELTA.swap(0, Ordering::SeqCst)
+    }
+    
 }

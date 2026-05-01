@@ -92,6 +92,23 @@ impl DynamicVertexBuffer {
         self.count = n;
     }
 
+    /// Copy two vertex slices into the mapped region back to back.
+    /// Used by the renderer to upload game and HUD geometry in one
+    /// buffer so they can be drawn with different push constants
+    /// through two `cmd_draw` calls without rebinding the buffer.
+    pub fn upload_two(&mut self, first: &[Vertex], second: &[Vertex]) {
+        let a_n = first.len().min(self.capacity);
+        let b_n = second.len().min(self.capacity - a_n);
+        unsafe {
+            ptr::copy_nonoverlapping(first.as_ptr(), self.mapped, a_n);
+            if b_n > 0 {
+                ptr::copy_nonoverlapping(
+                    second.as_ptr(), self.mapped.add(a_n), b_n);
+            }
+        }
+        self.count = a_n + b_n;
+    }
+
     /// Unmap, free the backing memory and destroy the buffer. Caller
     /// must ensure the device is idle.
     pub fn destroy(&self, device: &Device) {

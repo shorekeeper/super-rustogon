@@ -15,14 +15,21 @@
 //! * Color blend: straight alpha blending.
 //! * Depth / stencil: not attached.
 //!
-//! Push constants layout (16 bytes):
+//! Push constants layout (80 bytes):
 //!
-//! * `vec2 scale`  — aspect correction scale factors.
-//! * `vec2 shake`  — per-frame screen-shake offset in game space.
-//!
-//! The shake is applied inside the vertex shader BEFORE the aspect
-//! scale so it reads as a true translation of the playfield rather
-//! than a stretched displacement that depends on window shape.
+//! * `mat4 view_proj` - combined view * projection matrix built
+//!   on the CPU each frame. Contains camera pitch / roll and
+//!   the aspect correction for the current swapchain extent.
+//!   When pitch = roll = 0 the matrix degenerates to exactly
+//!   the mapping the legacy 2D path used, so menus and the
+//!   editor render unchanged.
+//! * `vec2 shake` - per-frame screen-shake offset in game space,
+//!   applied BEFORE the matrix so trauma reads as the tunnel
+//!   itself jittering rather than a screen-space wobble.
+//! * `float zoom` - uniform camera zoom, also applied BEFORE
+//!   the matrix. 1.0 is neutral.
+//! * `float _pad` - reserved, keeps the struct 16-byte aligned
+//!   at the tail.
 
 use ash::{vk, Device};
 use std::ffi::CStr;
@@ -48,20 +55,35 @@ impl Vertex {
     }
 }
 
-/// Matches the `PushConstants` block in main.vert byte for byte.
-/// Layout in v2:
+/// Matches the `PushConstants` block in main.vert byte for
+/// byte. Total size is exactly 32 bytes so it fits in the
+/// minimum guaranteed push constant range (128 bytes) with
+/// plenty of headroom.
 ///
-///   0..8   vec2 scale  (aspect correction)
-///   8..16  vec2 shake  (screen shake offset in game space)
-///   16..20 float zoom  (camera zoom; 1.0 is neutral)
-///   20..32 float _pad[3]
+/// Layout:
+///
+///   offset  field         purpose
+///    0..8   scale         aspect correction
+///    8..16  shake         screen shake offset (pre-aspect)
+///   16..20  zoom          uniform scale
+///   20..24  tilt_angle    Z-axis roll in radians
+///   24..28  tilt_pitch    X-axis pitch in radians (perspective)
+///   28..32  tilt_yaw      Y-axis yaw in radians (perspective)
+///
+/// The tilt fields are new as of the perspective tilt
+/// revision. They drive a fake-3D transformation inside the
+/// vertex shader so a DSL `:tilt` trigger visibly skews the
+/// entire framebuffer, including the FPS overlay and any
+/// other geometry that rides the main pipeline.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PushConstants {
-    pub scale: [f32; 2],
-    pub shake: [f32; 2],
-    pub zoom:  f32,
-    pub _pad:  [f32; 3],
+    pub scale:      [f32; 2],
+    pub shake:      [f32; 2],
+    pub zoom:       f32,
+    pub tilt_angle: f32,
+    pub tilt_pitch: f32,
+    pub tilt_yaw:   f32,
 }
 
 pub struct Pipeline {
@@ -141,7 +163,7 @@ impl Pipeline {
             let dynamic = vk::PipelineDynamicStateCreateInfo::default()
                 .dynamic_states(&dyn_states);
 
-            // Push constants now hold (scale, shake), 16 bytes total.
+            // Push constants: 80 bytes, vertex stage only.
             let push_ranges = [vk::PushConstantRange::default()
                 .stage_flags(vk::ShaderStageFlags::VERTEX)
                 .offset(0)

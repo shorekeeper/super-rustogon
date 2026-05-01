@@ -1,96 +1,42 @@
 //! Rustogon Level Format entry point.
 //!
-//! The engine ships with two parsers. A given `.rlf` file picks
-//! one via a file-level directive placed before the `level`
-//! keyword:
+//! As of this revision only the v3 parser is shipped. The
+//! historical v1 and v2 dialects have been retired; every
+//! `.rlf` file the engine loads is parsed by `parser_v3`.
 //!
-//! * no directive, or anything else       -> v1 (stable).
-//! * `#[use_v2]`                          -> v2 (richer syntax).
+//! # File directives
 //!
-//! Both parsers produce the same [`LevelAst`], so the rest of
-//! the engine has no idea which dialect was used.
-//!
-//! # v1 fingerprints
-//!
-//! Curly-brace records, `key = value` fields, commas cosmetic.
-//! Lived here since the start, kept as the default because
-//! every existing level file is written in it.
-//!
-//! # v2 fingerprints
-//!
-//! * `:atom` literals for enum-valued fields
-//!   (`dir = :cw`, `anim = :ease_out`).
-//! * Sigils `~p"..."`, `~m"..."`, `~f"..."` for paths, masks,
-//!   and formulas respectively.
-//! * `do ... end` as a synonym for `{ ... }`.
-//! * `|>` pipe chains for triggers
-//!   (`trigger :flip |> :shake { ... }`).
-//! * `>>` modifier chains on obstacles
-//!   (`emit spiral { ... } >> :thickness { mult = 1.3 }`).
-//! * `where x = 1, y = 2` bindings introducing local scope
-//!   before a section body.
-//! * `::` type annotations on `var` declarations.
-//! * Enum ranges via `A..B` (also accepted in v1).
-//! * Bare identifiers resolve through the variable scope, so
-//!   a `where`-bound name can be used directly without `@`.
-//!
-//! Opt in at the very top of the file:
-//!
-//!     #[use_v2]
-//!
-//!     level "My Song" do
-//!         meta do
-//!             author = "Me"
-//!             music  = ~p"assets/music/track.qoa"
-//!             bpm    = 128
-//!         end
-//!
-//!         -- rest of the file ...
-//!     end
+//! A file may still opt in to v3 explicitly with the
+//! `#[use_v3]` directive at the top. This is purely
+//! self-documenting; absence of any dialect directive is
+//! treated the same as presence of `#[use_v3]`. Legacy
+//! `#[use_v2]` and `#[use_v1]` directives are silently
+//! ignored, which means those old files fail at the first
+//! non-v3 syntax they contain rather than silently degrading
+//! to an older parser.
 //!
 //! # Safety
 //!
-//! Both parsers enforce the same invariants: thickness clamps,
-//! mask gaps, formula pathability, survivable patterns. A bad
-//! level fails at load time with a `ParseError` carrying the
-//! source line and column, never silently degrades at runtime.
+//! The v3 parser enforces every invariant the runtime relies
+//! on: thickness clamps, mask gaps, formula pathability,
+//! survivable patterns. A bad level fails at load time with a
+//! `ParseError` carrying the source line and column, never
+//! silently degrades at runtime.
 
 pub mod ast;
-pub mod parser;
-pub mod parser_v2;
+pub mod parser_v3;
 pub mod formula;
+pub mod safety;
+pub mod meta;
+pub mod expander;
+pub mod rules;
 
 pub use ast::*;
-pub use parser::ParseError;
+pub use parser_v3::ParseError;
 
-/// Parse a `.rlf` source buffer. Selection between v1 and v2
-/// happens here based on whether `#[use_v2]` appears in the
-/// file-level directive prelude.
+/// Parse a `.rlf` source buffer. The v3 parser is always
+/// used; older dialect directives (`#[use_v2]`, `#[use_v1]`)
+/// are tolerated but do not change the parsing path.
 pub fn parse_level(src: &str) -> Result<LevelAst, ParseError> {
-    if detect_use_v2(src) {
-        parser_v2::parse_level(src)
-    } else {
-        parser::parse_level(src)
-    }
-}
-
-/// Cheap scan for `#[use_v2]` among the leading `#[...]`
-/// directives. Stops at the first non-comment, non-directive
-/// line so directives embedded deeper in the file cannot
-/// retroactively switch parsers.
-fn detect_use_v2(src: &str) -> bool {
-    for line in src.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty()           { continue; }
-        if trimmed.starts_with("//")    { continue; }
-        if trimmed.starts_with("--")    { continue; }
-        if trimmed.starts_with("#[") {
-            let inner = trimmed[2..].trim_start();
-            if inner.starts_with("use_v2") { return true; }
-            continue;
-        }
-        // Reached real content without seeing the directive.
-        return false;
-    }
-    false
+    parser_v3::parse_level(src)
 }

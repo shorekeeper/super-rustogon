@@ -49,14 +49,29 @@ use crate::pipeline::Vertex;
 use crate::text::{push_text, push_text_alpha, text_height, text_width};
 use crate::ui::draw::{push_hex_alpha, push_ring_circle_alpha};
 use crate::win32::Input;
+use crate::dsl::rules::AbilityKind;
+use crate::rule_engine::RuleEngine;
+
+/// Baseline camera pitch always applied during gameplay, in
+/// radians. Roughly 6 degrees: enough to give the playfield an
+/// Open Hexagon style tunnel-floor look without making text or
+/// projectile trajectories hard to read. Menus and the editor
+/// do not apply this; they drive the renderer with pitch = 0.
+const BASELINE_PITCH: f32 = 0.0;
+
+/// Perspective strength used during gameplay, 0..1. Full
+/// perspective divide; the small baseline pitch above keeps the
+/// actual visible distortion subtle, so "full" here still reads
+/// as SH-style mild 3D rather than an OH fish-eye.
+const BASELINE_PERSP: f32 = 1.0;
 
 const TAU: f32 = std::f32::consts::TAU;
 
 /// Number of slots the playfield is divided into. Matches the AST
 /// default; levels with a non 6 sides still display on a 6 slot
 /// renderer (the renderer is hard coded for hexagons).
-const SLOTS: u32 = 6;
-const SLOT_ANGLE: f32 = TAU / SLOTS as f32;
+//fallback: const SLOTS: u32 = 6;
+//fallback: const SLOT_ANGLE: f32 = TAU / SLOTS as f32;
 
 const PLAYER_RADIUS:     f32 = 0.18;
 const PLAYER_HEIGHT:     f32 = 0.035;
@@ -121,15 +136,18 @@ const MILESTONES: &[f32] = &[10.0, 30.0, 60.0, 90.0, 120.0, 180.0, 240.0];
 
 #[derive(Clone, Copy)]
 struct Wall {
-    slot:      u32,
-    distance:  f32,
+    /// Starting angle in radians, in generator coordinate
+    /// space (0 at +X axis). Fixed at spawn time. A polygon
+    /// morph does not rewrite this, so existing walls keep
+    /// their original angular trajectory even when the
+    /// playfield changes shape underneath them.
+    angle_start: f32,
+    /// Angular span. Equal to `TAU / slot_count_at_spawn`,
+    /// also frozen at spawn time.
+    angle_span: f32,
+    distance: f32,
     thickness: f32,
-    /// Has this wall already fired a close-call event? Prevents
-    /// one wall from repeatedly emitting particles while it
-    /// crawls past the player.
     close_fired: bool,
-    /// Seconds since the wall was pushed into the simulation.
-    /// Drives the fresh-spawn flash.
     spawn_age: f32,
 }
 
@@ -242,12 +260,28 @@ pub struct Game {
     // Visual state.
     particles:         ParticleSystem,
     shake:             ScreenShake,
+    /// Runtime rule state driven by the level's DSL.
+    ///
+    /// Every `rule`, `revert`, `push`, or `pop` statement
+    /// emitted by the generator is fed into this engine; the
+    /// simulation then reads the flattened effective state
+    /// through helpers like `active_ability()` and
+    /// `effective_invert()`. The engine is seeded from the
+    /// level's file level baseline in `Game::new` and reset
+    /// along with the rest of the run in `Game::restart`.
+    rule_engine:       RuleEngine,
     echoes:            Vec<PulseEcho>,
     close_call_count:  u32,
     milestone_bits:    u32,
     milestones:        Vec<Milestone>,
     flip_flash_timer:  f32,
     prng:              u32,
+    /// Copied from `level.ast.ignore_collisions` on construction.
+    /// When true, collision checks still run (close calls,
+    /// shield bookkeeping, particles) but `kill_core` never
+    /// fires. A subtle HUD label warns the author the mode is
+    /// active.
+    ignore_collisions: bool,
 }
 
 impl Game {
@@ -271,8 +305,13 @@ impl Game {
             camera_dir:         1.0,
             camera_target_dir:  1.0,
             camera_flip_timer:  CAMERA_FLIP_MIN,
-            player_ang:         SLOT_ANGLE * 0.5,
-            prev_player_ang:    SLOT_ANGLE * 0.5,
+            // Starting angle places the cursor in the middle of slot
+            // 0 of whatever polygon the level declared. Computed from
+            // `level.ast.generation.sides` rather than a global
+            // constant so a three-sided or twelve-sided level opens
+            // with the cursor centered correctly.
+            player_ang:      (TAU / level.ast.generation.sides.max(3) as f32) * 0.5,
+            prev_player_ang: (TAU / level.ast.generation.sides.max(3) as f32) * 0.5,
             player_ang_vel:     0.0,
             walls:              Vec::with_capacity(128),
             level_speed_mult:   level.ast.generation.speed_mult,
@@ -311,12 +350,14 @@ impl Game {
 
             particles:        ParticleSystem::new(),
             shake:            ScreenShake::new(),
+            rule_engine:      RuleEngine::new(level.ast.rules.clone()),
             echoes:           Vec::with_capacity(16),
             close_call_count: 0,
             milestone_bits:   0,
             milestones:       Vec::new(),
             flip_flash_timer: 0.0,
             prng:             level.seed ^ 0xCAFE1234,
+            ignore_collisions: level.ast.ignore_collisions,
         };
         g.particles.set_density(config.particle_density.factor());
         g.shake.set_user_scale(config.screen_shake);
@@ -349,14 +390,50 @@ impl Game {
 
     pub fn shake_offset(&self) -> (f32, f32) { self.shake.offset() }
 
+    /// Camera pitch in radians for the vertex shader. Combines
+    /// the always-on baseline with whatever the generator reports
+    /// for the DSL `:tilt` trigger. This is the axis that tilts
+    /// the hexagon plane in 3D, the SH/OH "look down into the
+    /// tunnel" effect. Driving tilt through pitch instead of roll
+    /// is what makes the hexagon itself appear tilted rather than
+    /// the whole screen rotating around the cursor.
+    pub fn camera_pitch(&self) -> f32 {
+        self.generator.camera_pitch()
+    }
+
+    /// Camera roll in radians for the vertex shader. Currently
+    /// pinned to zero: SH/OH reserve screen-roll for very rare
+    /// hype moments, not the bread-and-butter tilt trigger, and
+    /// applying roll to everything including HUD text reads as
+    /// "the whole game window is broken" rather than "the camera
+    /// moved". If a future DSL trigger wants an epic roll it can
+    /// feed a dedicated field here without touching pitch.
+    pub fn camera_roll(&self) -> f32 {
+        0.0
+    }
+
+    /// Perspective strength in 0..1 for the vertex shader. Held
+    /// at the baseline so the pitch above actually reads as 3D
+    /// rather than a flat shear. Exposed as a method so the
+    /// renderer has a single source of truth for the shader
+    /// interface.
+    pub fn camera_perspective(&self) -> f32 {
+        BASELINE_PERSP
+    }
+
     fn restart(&mut self, audio: &Audio, level: &Level) {
         self.run_time          = 0.0;
         self.camera_rot        = 0.0;
         self.camera_dir        = 1.0;
         self.camera_target_dir = 1.0;
         self.camera_flip_timer = CAMERA_FLIP_MIN;
-        self.player_ang        = SLOT_ANGLE * 0.5;
-        self.prev_player_ang   = SLOT_ANGLE * 0.5;
+        // Respawn the cursor in slot 0 of the current target
+        // polygon. `self.generator.sides()` already reflects the
+        // level's `generation.sides` at this point because the
+        // generator is about to be rebuilt below.
+        let init_slot = TAU / self.generator.sides().max(3) as f32;
+        self.player_ang      = init_slot * 0.5;
+        self.prev_player_ang = init_slot * 0.5;
         self.player_ang_vel    = 0.0;
         self.walls.clear();
         self.generator = Generator::new(
@@ -381,10 +458,19 @@ impl Game {
         self.milestone_bits    = 0;
         self.milestones.clear();
         self.flip_flash_timer  = 0.0;
-
+        // Rule engine is reset to the file level baseline so
+        // a retry plays from the same rule state as the first
+        // attempt. Without this, a level that pushed a
+        // transient rule override before dying would leave the
+        // simulation in that overridden state across the
+        // restart.
+        self.rule_engine.reset();
         if !self.current_music_path.is_empty() {
-            audio.restart_music(&self.current_music_path);
-        }
+        audio.restart_music_at(
+            &self.current_music_path,
+            level.ast.start_from_seconds.max(0.0),
+        );
+    }
         self.prev_onset_counter = audio.onset_counter();
     }
 
@@ -393,6 +479,46 @@ impl Game {
     fn rng(&mut self) -> f32 {
         self.prng = self.prng.wrapping_mul(1664525).wrapping_add(1013904223);
         (self.prng >> 8) as f32 / (1u32 << 24) as f32
+    }
+
+    /// Ability currently in effect for gameplay.
+    ///
+    /// When the level's rule state carries an ability override
+    /// (either from its file level directive or from a
+    /// `rule ability { kind = ... }` statement), that override
+    /// wins. Otherwise the player's configured ability from
+    /// the options screen applies. `Some(AbilityKind::None)`
+    /// and "no override" are deliberately distinct: the first
+    /// forces the player to play without any gadget, the
+    /// second defers to user config.
+    fn active_ability(&self) -> Ability {
+        match self.rule_engine.ability_override_kind() {
+            Some(AbilityKind::None)   => Ability::None,
+            Some(AbilityKind::Dash)   => Ability::Dash,
+            Some(AbilityKind::Shield) => Ability::Shield,
+            Some(AbilityKind::SlowMo) => Ability::SlowMo,
+            None                      => self.cfg_ability,
+        }
+    }
+
+    /// Combined input inversion state: either the DSL
+    /// `:invert` trigger or the rule engine's `input.inverted`
+    /// flag makes the player's left / right controls swap. If
+    /// both are active the controls un-swap back to normal, in
+    /// keeping with boolean XOR semantics (which matches what
+    /// an author would intuitively expect: authored invert
+    /// modifies the authored state, player-side invert
+    /// modifies what the player experiences, and combining
+    /// two inversions cancels).
+    fn effective_invert(&self) -> bool {
+        self.generator.is_inverted() ^ self.rule_engine.effective().input_inverted
+    }
+
+    /// Combined cursor rotation multiplier: the
+    /// `speedwarp.cursor` trigger axis stacked multiplicatively
+    /// with the rule engine's `cursor.speed_mult`.
+    fn effective_cursor_mult(&self) -> f32 {
+        self.generator.cursor_mult() * self.rule_engine.effective().cursor_speed_mult
     }
 
     pub fn update(&mut self, dt: f32, input: Input, audio: &Audio, level: &Level) {
@@ -455,7 +581,12 @@ impl Game {
         match self.state {
             RunState::Alive => {
                 self.update_alive(dt, input, audio, onset_fired, shift_edge);
-                if self.collides(audio) { self.kill_core(); }
+                // Collision detection always runs so shield / close-call
+                // bookkeeping keeps working. Only the terminal
+                // `kill_core` is gated on the debug flag.
+                if self.collides(audio) && !self.ignore_collisions {
+                    self.kill_core();
+                }
                 self.sample_trail(dt);
                 self.check_milestones();
             }
@@ -494,31 +625,67 @@ impl Game {
         &mut self, dt: f32, input: Input, audio: &Audio,
         _onset_fired: bool, shift_edge: bool,
     ) {
-        // `:shake` trigger: keep trauma topped up against
-        // ScreenShake's own exp decay (rate 1.6/s) so the
-        // perceived intensity matches the authored `strength`
-        // for the full `duration`. Linear `life` envelope
-        // ramps it out at the tail.
-        self.slowmo_active = matches!(self.cfg_ability, Ability::SlowMo) && input.shift;
+        // Slow-mo ability halves the effective time step while the
+        // player holds Shift. Every downstream integrator uses
+        // `eff_dt`, so the entire simulation (walls, camera, timers,
+        // particles) slows together rather than only a subset.
+        self.slowmo_active = matches!(self.active_ability(), Ability::SlowMo)
+            && input.shift;
         let eff_dt = if self.slowmo_active { dt * 0.45 } else { dt };
+
+        // Advance the generator first. Doing it before any state is
+        // read means triggers fired this frame are already reflected
+        // in `shake_envelope`, `spin_rate`, `freeze_factor`, and the
+        // rest of the accessor methods below. Rule statements that
+        // came due on the same tick are drained right after so the
+        // rule engine lines up with whatever the generator just
+        // pushed into the world.
+        self.generator.update(
+            eff_dt, audio.music_position(), audio.music_duration());
+        let engine = &mut self.rule_engine;
+        self.generator.drain_rules(|stmt| engine.apply(stmt));
+
+        // Screen shake from the `:shake` trigger. Trauma is topped
+        // up every frame against ScreenShake's own decay so the
+        // perceived amplitude matches the authored strength for the
+        // full authored duration, with a linear tail coming from the
+        // `life` factor of the envelope.
         let (shake_strength, shake_life) = self.generator.shake_envelope();
         if shake_strength > 0.0 && shake_life > 0.0 && !self.cfg_reduce_motion {
             self.shake.add(shake_strength * shake_life * 1.6 * eff_dt);
         }
 
+        // Per-onset trauma bounce. While `:bounce` is active, every
+        // detected audio onset injects trauma proportional to the
+        // authored amplitude. Unaffected by `reduce_motion` because
+        // the setting already gates the shake accumulator.
+        let bounce = self.generator.bounce_amplitude();
+        if bounce > 0.0 && _onset_fired && !self.cfg_reduce_motion {
+            self.shake.add(bounce * 0.6);
+        }
+
         self.run_time += eff_dt;
 
         // Camera wobble scales every rotational effect. At 0 the
-        // camera is perfectly still which is the accessibility
-        // preset; at 1 it matches the original game.
+        // camera is still (accessibility preset); at 1 it matches
+        // the original game's feel.
         let wobble = self.cfg_camera_wobble.clamp(0.0, 1.0);
 
+        // Scheduled spontaneous flip. Tick the timer, and if it
+        // expires, reverse target direction and reset using a
+        // pseudo-random jitter derived from the current speed
+        // multiplier so the cadence never locks into a pattern.
         self.camera_flip_timer -= eff_dt;
         if self.camera_flip_timer <= 0.0 {
             self.camera_target_dir = -self.camera_target_dir;
             let r = (self.generator.speed_mult().fract().abs() + 0.3).fract();
             self.camera_flip_timer = CAMERA_FLIP_MIN + r * CAMERA_FLIP_RANGE;
         }
+
+        // Authored `:flip` trigger. Takes precedence over the
+        // scheduled flip above by restarting its timer, plays a
+        // feedback click, injects a small trauma impulse, and arms
+        // the full-screen white flash used as visual confirmation.
         if self.generator.take_flip_request() {
             self.camera_target_dir = -self.camera_target_dir;
             self.camera_flip_timer = CAMERA_FLIP_MIN;
@@ -526,16 +693,25 @@ impl Game {
             if !self.cfg_reduce_motion { self.shake.add(0.12); }
             self.flip_flash_timer = FLIP_FLASH_SECONDS;
         }
+
+        // Ease current direction toward target so flips read as a
+        // smooth reversal instead of a hard sign change.
         let blend = 1.0 - (-CAMERA_EASE_RATE * eff_dt).exp();
         self.camera_dir += (self.camera_target_dir - self.camera_dir) * blend;
 
+        // Camera rotation. Combines tier and level multipliers with
+        // the generator's own rotation axis from `:speedwarp` and
+        // the continuous authored spin from `:spin`.
         let cam_mult = (self.tier.wall_speed_mult()
                         * self.level_speed_mult).min(2.5);
         self.camera_rot += eff_dt * CAMERA_SPEED * self.camera_dir
             * cam_mult * wobble * self.generator.rotation_mult();
+        self.camera_rot += self.generator.spin_rate() * eff_dt;
 
-        // Player turn input, honoring the generator's invert
-        // state and the v2 `speedwarp.cursor` axis.
+        // Player turn input. Honors the generator's invert state and
+        // the `:speedwarp` cursor axis. Raw angle is kept unwrapped
+        // so the velocity filter below sees a clean delta even when
+        // the player crosses the TAU boundary.
         self.prev_player_ang = self.player_ang;
         let mut p = 0.0;
         if input.left  { p -= 1.0; }
@@ -544,23 +720,31 @@ impl Game {
         let cursor_mult = self.generator.cursor_mult();
         self.player_ang +=
             p * PLAYER_ROT_SPEED * self.tier.player_speed_mult()
-              * self.cfg_player_speed * cursor_mult * eff_dt;
+            * self.cfg_player_speed * cursor_mult * eff_dt;
         if self.player_ang >  TAU { self.player_ang -= TAU; }
         if self.player_ang < -TAU { self.player_ang += TAU; }
 
-        // Angular velocity, low-pass filtered so a single frame of
-        // noise does not flash the trail / squash effects.
-        let mut raw_vel = (self.player_ang - self.prev_player_ang) / eff_dt.max(1e-4);
-        if raw_vel >  PLAYER_ROT_SPEED * 3.0 { raw_vel -= TAU / eff_dt.max(1e-4); }
-        if raw_vel < -PLAYER_ROT_SPEED * 3.0 { raw_vel += TAU / eff_dt.max(1e-4); }
+        // Filtered angular velocity. The raw delta can spike when
+        // the angle wraps, so wrap-aware correction happens before
+        // the low-pass filter that feeds the trail and cursor
+        // squash visuals.
+        let mut raw_vel = (self.player_ang - self.prev_player_ang)
+            / eff_dt.max(1e-4);
+        if raw_vel >  PLAYER_ROT_SPEED * 3.0 {
+            raw_vel -= TAU / eff_dt.max(1e-4);
+        }
+        if raw_vel < -PLAYER_ROT_SPEED * 3.0 {
+            raw_vel += TAU / eff_dt.max(1e-4);
+        }
         let sm = 1.0 - (-18.0 * eff_dt).exp();
         self.player_ang_vel += (raw_vel - self.player_ang_vel) * sm;
 
-        // Trail afterimage: one frame of reduced-alpha ghost per
-        // frame of fast turning.
+        // Passive trail afterimages when the cursor turns fast.
+        // Gated by the accessibility reduce-motion setting so the
+        // playfield stays clean for users who requested it.
         if !self.cfg_reduce_motion {
             let speed_norm = (self.player_ang_vel.abs()
-                              / (PLAYER_ROT_SPEED * 1.2)).clamp(0.0, 1.0);
+                            / (PLAYER_ROT_SPEED * 1.2)).clamp(0.0, 1.0);
             if speed_norm > 0.25 {
                 self.afterimages.push(Afterimage {
                     angle:    self.player_ang,
@@ -571,14 +755,21 @@ impl Game {
             }
         }
 
-        // Dash.
+        // Dash ability. Cooldown ticks every frame regardless of
+        // slow-mo so the cooldown reads in wall-clock seconds.
+        // Dashing snaps the player one slot in the current turn
+        // direction and pushes a strong afterimage.
         if self.dash_cooldown > 0.0 { self.dash_cooldown -= dt; }
-        if matches!(self.cfg_ability, Ability::Dash)
+        if matches!(self.active_ability(), Ability::Dash)
             && shift_edge && self.dash_cooldown <= 0.0
         {
             let dir = if p >= 0.0 { 1.0 } else { -1.0 };
             let old = self.player_ang;
-            self.player_ang += SLOT_ANGLE * dir;
+            // Dash jumps exactly one slot of the current polygon.
+            // Using `self.generator.sides()` means the jump width
+            // adapts automatically if the level morphed mid run.
+            let slot_angle = TAU / self.generator.sides().max(3) as f32;
+            self.player_ang += slot_angle * dir;
             self.dash_cooldown = DASH_COOLDOWN;
             audio.play_interact();
             self.afterimages.push(Afterimage {
@@ -590,24 +781,32 @@ impl Game {
             if !self.cfg_reduce_motion { self.shake.add(0.05); }
         }
 
-        // Shield recharges over time.
-        if matches!(self.cfg_ability, Ability::Shield) {
+        // Shield ability regenerates slowly while held.
+        if matches!(self.active_ability(), Ability::Shield) {
             self.shield_charge = (self.shield_charge + eff_dt * 0.08).min(1.0);
         }
 
+        // Compute the effective wall speed after every multiplier
+        // (tier, level, speedwarp, freeze) is known to the
+        // generator. Integrate wall positions and spawn age against
+        // this single value so a freeze trigger truly halts motion.
         let wall_speed = self.current_wall_speed();
-
-        // Move walls and age their spawn_age.
         for w in self.walls.iter_mut() {
             w.distance -= wall_speed * eff_dt;
             w.spawn_age += eff_dt;
         }
 
-        // Close-call detection and particle emission.
+        // Close-call detection. A wall that sweeps past the player
+        // in an adjacent slot, within a narrow radial band just
+        // outside the cursor, is a close call. Fires particles,
+        // trauma, and a touch sound, but only once per wall.
+        //
+        // "Adjacent slot" is resolved purely by angular distance so
+        // the logic works for any polygon shape, not just hex.
         if self.cfg_close_fx {
-            let mut player_slot = (self.player_ang.rem_euclid(TAU) / SLOT_ANGLE) as i32;
-            if player_slot < 0 { player_slot += SLOTS as i32; }
-            let player_slot = (player_slot as u32) % SLOTS;
+            let sides = self.generator.sides().max(3);
+            let slot_angle = TAU / sides as f32;
+            let player_ang_norm = self.player_ang.rem_euclid(TAU);
             let p_inner = PLAYER_RADIUS;
 
             let mut close_events: Vec<(f32, f32)> = Vec::new();
@@ -615,17 +814,20 @@ impl Game {
                 if w.close_fired { continue; }
                 let outer = w.distance + w.thickness;
                 if outer < p_inner + CLOSE_CALL_RADIAL_BAND
-                   && outer > p_inner - CLOSE_CALL_RADIAL_BAND * 0.5
+                && outer > p_inner - CLOSE_CALL_RADIAL_BAND * 0.5
                 {
-                    if w.slot != player_slot {
-                        let diff = (w.slot as i32 - player_slot as i32)
-                                   .rem_euclid(SLOTS as i32);
-                        if diff == 1 || diff == SLOTS as i32 - 1 {
-                            let a = w.slot as f32 * SLOT_ANGLE + self.camera_rot
-                                  + SLOT_ANGLE * 0.5;
-                            close_events.push((a, outer));
-                            w.close_fired = true;
-                        }
+                    let wall_center = (w.angle_start
+                        + w.angle_span * 0.5).rem_euclid(TAU);
+                    let mut diff = (wall_center - player_ang_norm)
+                        .rem_euclid(TAU);
+                    if diff > TAU * 0.5 { diff = TAU - diff; }
+                    // Adjacent means roughly one slot away in
+                    // either direction. The >0.5 lower bound rules
+                    // out "same slot" (that's a collision), the
+                    // <1.5 upper bound rules out "two slots away".
+                    if diff > slot_angle * 0.5 && diff < slot_angle * 1.5 {
+                        close_events.push((wall_center + self.camera_rot, outer));
+                        w.close_fired = true;
                     }
                 }
             }
@@ -635,33 +837,76 @@ impl Game {
                 let pos = [ang.cos() * r, ang.sin() * r];
                 let mut seed = self.prng;
                 self.particles.emit_burst(
-                    pos, 14, 1.6, self.palette.accent, 0.55, 0.025, &mut seed,
+                    pos, 14, 1.6, self.palette.accent,
+                    0.55, 0.025, &mut seed,
                 );
                 self.prng = seed;
                 audio.play_touch();
             }
         }
 
+        // Drop walls that passed the inner kill radius so they do
+        // not keep consuming collision tests or draw vertices.
         self.walls.retain(|w| w.distance + w.thickness > WALL_KILL_R);
 
-        self.generator.update(
-            eff_dt, audio.music_position(), audio.music_duration());
-
+        // Spawn any walls whose scheduled time arrived this frame.
+        // Thickness is a base value plus a radial contribution
+        // proportional to the authored length in seconds, so longer
+        // obstacles genuinely occupy more radial space.
+        //
+        // The callback now receives `slot_count` alongside `slot`
+        // so we can project each wall onto the angular geometry it
+        // was designed for, regardless of any morph in progress on
+        // the visual playfield.
         let walls_ref = &mut self.walls;
         let wspd = wall_speed;
-        self.generator.drain_walls(|slot, thickness_mult, length_seconds| {
+        self.generator.drain_walls(|slot, slot_count, thickness_mult, length_seconds| {
             let base  = WALL_BASE_THICK * thickness_mult;
             let extra = (wspd * length_seconds).max(0.0);
             let thickness = (base + extra).min(3.0);
+            let slot_angle = TAU / slot_count.max(3) as f32;
+            let angle_start = slot as f32 * slot_angle;
             walls_ref.push(Wall {
-                slot, distance: WALL_SPAWN_R, thickness,
-                close_fired: false, spawn_age: 0.0,
+                angle_start,
+                angle_span: slot_angle,
+                distance: WALL_SPAWN_R,
+                thickness,
+                close_fired: false,
+                spawn_age: 0.0,
             });
         });
 
-        let _ = CLOSE_CALL_ANGLE; // kept for future tuning
-    }
+        // One-shot burst events. The generator hands them over as
+        // Options so a pending burst cannot fire twice, and the
+        // visuals for each (count, speed, color, trauma) scale with
+        // the authored strength.
+        if let Some(strength) = self.generator.take_centerburst() {
+            let count = (14.0 + strength * 24.0) as u32;
+            let speed = 1.6 + strength * 1.4;
+            let color = self.palette.accent;
+            let mut seed = self.prng;
+            self.particles.emit_burst(
+                [0.0, 0.0], count, speed, color, 0.7, 0.035, &mut seed);
+            self.prng = seed;
+            if !self.cfg_reduce_motion {
+                self.shake.add(0.1 * strength);
+            }
+        }
+        if let Some((count, duration)) = self.generator.take_ringburst() {
+            let color = self.palette.accent;
+            for i in 0..count {
+                let delay = duration * (i as f32) / (count as f32);
+                self.echoes.push(PulseEcho {
+                    age:   -delay,
+                    life:  0.6 + duration,
+                    color,
+                });
+            }
+        }
 
+        // Retained for future tuning of close-call sensitivity.
+        let _ = CLOSE_CALL_ANGLE;
+    }
     /// Advance the replay buffer. Sampled at fixed intervals so
     /// the ghost arc looks uniform regardless of frame time.
     fn sample_trail(&mut self, dt: f32) {
@@ -705,13 +950,73 @@ impl Game {
     }
     
     /// Current camera zoom for the renderer push constants.
-    pub fn zoom(&self) -> f32 { self.generator.zoom() }
+    pub fn zoom(&self) -> f32 {
+        let base = self.generator.zoom();
+        let punch = self.generator.zoom_punch_offset();
+        (base + punch).clamp(0.1, 5.0)
+    }
+
+    /// Current camera tilt vector ready for `Renderer::set_tilt`.
+    /// Components are `[angle (Z-roll), pitch (X), yaw (Y)]` in
+    /// radians.
+    ///
+    /// The Z-roll component is deliberately zeroed here because
+    /// the playfield's own `cam_fg` already includes the tilt
+    /// angle on the CPU side. Letting the shader rotate a
+    /// second time would both double the effect on gameplay
+    /// geometry and, worse, rotate HUD text that has no
+    /// business tilting with the camera.
+    ///
+    /// Pitch and yaw stay in the shader. They drive the fake
+    /// perspective divide which is naturally per-vertex work,
+    /// and at the 30 degree authored limit their influence on
+    /// HUD legibility is small enough to accept.
+    pub fn tilt(&self) -> [f32; 3] {
+        let limit = 0.55;
+        [
+            0.0,
+            self.generator.camera_pitch().clamp(-limit, limit),
+            self.generator.camera_yaw().clamp(-limit, limit),
+        ]
+    }
 
     /// Post-process glitch intensity for this frame.
     pub fn glitch_amount(&self) -> f32 { self.generator.glitch_amount() }
 
     /// Strobe flash alpha for this frame.
     pub fn strobe_alpha(&self) -> f32 { self.generator.strobe_alpha(self.time) }
+
+    pub fn invert_colors_amount(&self) -> f32 {
+        self.generator.invert_colors_amount()
+    }
+    pub fn grayscale_amount(&self) -> f32 {
+        self.generator.grayscale_amount()
+    }
+    pub fn shockwave_progress(&self) -> f32 {
+        self.generator.shockwave_progress()
+    }
+    pub fn shockwave_strength(&self) -> f32 {
+        self.generator.shockwave_strength()
+    }
+    pub fn fog_bounds(&self) -> (f32, f32) {
+        self.generator.fog_bounds()
+    }
+    pub fn outline_amount(&self) -> f32 {
+        self.generator.outline_amount()
+    }
+    pub fn flash_alpha_bassdrop(&self) -> f32 {
+        self.generator.flash_alpha()
+    }
+
+    /// Slot index and parameters of the user post shader
+    /// the active section currently requests, or `None`
+    /// when the default post pipeline should be used. The
+    /// main loop consults this once per frame to keep the
+    /// renderer in sync without the game having to know
+    /// about Vulkan.
+    pub fn active_post_shader(&self) -> Option<(u8, [f32; 4])> {
+        self.generator.active_post_shader()
+    }
 
     /// Music playback rate requested by the generator's
     /// `speedwarp` trigger. 1.0 is neutral.
@@ -728,33 +1033,43 @@ impl Game {
             let w_inner = w.distance;
             let w_outer = w.distance + w.thickness;
             if p_outer < w_inner || p_inner > w_outer { continue; }
-            let a0 = w.slot as f32 * SLOT_ANGLE + COLLISION_ANGLE_EPS;
-            let a1 = a0 + SLOT_ANGLE - 2.0 * COLLISION_ANGLE_EPS;
-            if a >= a0 && a < a1 {
-                // Shield absorbs first hit when fully charged.
-                if matches!(self.cfg_ability, Ability::Shield)
-                    && self.shield_charge >= 1.0
-                {
-                    self.shield_charge = 0.0;
-                    // Shield ripple: particle burst plus a cyan
-                    // pulse echo so the save reads as deliberate
-                    // rather than a missed collision.
-                    let ang = self.player_ang + self.camera_rot;
-                    let r = PLAYER_RADIUS + PLAYER_HEIGHT * 0.5;
-                    let pos = [ang.cos() * r, ang.sin() * r];
-                    let mut seed = self.prng;
-                    self.particles.emit_burst(
-                        pos, 22, 2.2, [0.55, 0.85, 1.0], 0.8, 0.035, &mut seed);
-                    self.prng = seed;
-                    self.echoes.push(PulseEcho {
-                        age: 0.0, life: 0.8, color: [0.55, 0.85, 1.0],
-                    });
-                    if !self.cfg_reduce_motion { self.shake.add(0.18); }
-                    audio.play_interact();
-                    return false;
-                }
-                return true;
+
+            // Angular containment. Wall spans
+            // [angle_start, angle_start + angle_span). Handle
+            // the wrap-around case so a wall that straddles
+            // the 0/TAU seam still collides correctly.
+            let wa_start = w.angle_start.rem_euclid(TAU);
+            let wa_end   = wa_start + w.angle_span;
+            let in_slot = if wa_end <= TAU {
+                a >= wa_start + COLLISION_ANGLE_EPS
+                    && a < wa_end - COLLISION_ANGLE_EPS
+            } else {
+                let wrapped = wa_end - TAU;
+                (a >= wa_start + COLLISION_ANGLE_EPS)
+                    || (a < wrapped - COLLISION_ANGLE_EPS)
+            };
+            if !in_slot { continue; }
+
+            // Shield absorbs first hit when fully charged.
+            if matches!(self.active_ability(), Ability::Shield)
+                && self.shield_charge >= 1.0
+            {
+                self.shield_charge = 0.0;
+                let ang = self.player_ang + self.camera_rot;
+                let r = PLAYER_RADIUS + PLAYER_HEIGHT * 0.5;
+                let pos = [ang.cos() * r, ang.sin() * r];
+                let mut seed = self.prng;
+                self.particles.emit_burst(
+                    pos, 22, 2.2, [0.55, 0.85, 1.0], 0.8, 0.035, &mut seed);
+                self.prng = seed;
+                self.echoes.push(PulseEcho {
+                    age: 0.0, life: 0.8, color: [0.55, 0.85, 1.0],
+                });
+                if !self.cfg_reduce_motion { self.shake.add(0.18); }
+                audio.play_interact();
+                return false;
             }
+            return true;
         }
         false
     }
@@ -768,6 +1083,7 @@ impl Game {
             * self.tier.wall_speed_mult()
             * self.level_speed_mult
             * self.generator.speed_mult()
+            * self.generator.freeze_factor()
     }
 
     fn kill_core(&mut self) {
@@ -809,37 +1125,52 @@ impl Game {
 
     pub fn build_geometry(&self, out: &mut Vec<Vertex>) {
         out.clear();
+        // Apply the Z-roll component of the camera tilt on the CPU
+        // so HUD overlays (FPS, editor banners, menu text) drawn
+        // through the same pipeline stay upright. Pitch and yaw
+        // still ride the vertex shader's perspective path because
+        // they need the per-vertex divide to look correct, and
+        // those axes do not affect 2D text legibility noticeably
+        // at the parser-enforced 30 degree clamp.
+        //
+        // The playfield now rotates visibly when a `:tilt { angle
+        // = X }` trigger fires: the shift lands directly on top of
+        // the always-on camera rotation, and because `tilt` eases
+        // toward its target over TILT_EASE_RATE the transition
+        // reads as a smooth lean rather than a single-frame jerk.
         let cam_fg = self.camera_rot + self.generator.camera_tilt();
-        // Background optionally uses a fractional tilt for a
-        // subtle parallax effect: when `cfg_parallax` is on the
-        // background leans opposite the foreground by half of
-        // the tilt, which makes the playfield feel like it has
-        // a camera relative to the world.
-        let cam_bg = if self.cfg_parallax {
-            self.camera_rot + self.generator.camera_tilt() * 0.5
-        } else {
-            cam_fg
-        };
+        let cam_bg = cam_fg;
+        let _ = self.cfg_parallax;
         let pulse  = decaying_beat_pulse(self.onset_phase)
                       .max(self.generator.pulse_boost())
                       * self.cfg_beat_flash;
         let dead_t = self.dead_intensity();
         let hue    = self.hue_offset;
 
-        // 1. Background wedges with a radial gradient. Center
-        //    color is a dimmed version of the per-wedge pattern
-        //    color, outer color is the pattern color at full
-        //    brightness. The interpolation happens across the
-        //    triangle inside the rasterizer.
+        // 1. Background wedges with a radial gradient. We draw
+        //    `BG_WEDGE_COUNT` thin wedges and color each one based
+        //    on which angular sector of the current N-gon it falls
+        //    in. This keeps the visual transition continuous when
+        //    `sides_fract()` is morphing between two integer values:
+        //    sector boundaries slide across the thin wedges rather
+        //    than snapping.
+        const BG_WEDGE_COUNT: u32 = 120;
         let bg_a_lit = brighten(rotate_hue(self.palette.bg_a, hue), 0.10 * pulse);
         let bg_b_lit = rotate_hue(self.palette.bg_b, hue);
         let bg_a_ctr = mul_color(bg_a_lit, 0.35);
         let bg_b_ctr = mul_color(bg_b_lit, 0.35);
-        for s in 0..SLOTS {
-            let a0 = s as f32 * SLOT_ANGLE + cam_bg;
-            let (oc, cc) = if s % 2 == 0 { (bg_a_lit, bg_a_ctr) }
-                           else          { (bg_b_lit, bg_b_ctr) };
-            push_wedge_gradient(out, a0, SLOT_ANGLE, BG_OUTER_R, cc, oc);
+        let sides_f = self.generator.sides_fract();
+        let bg_step = TAU / BG_WEDGE_COUNT as f32;
+        for s in 0..BG_WEDGE_COUNT {
+            let a0 = s as f32 * bg_step + cam_bg;
+            let angle_mid = (s as f32 + 0.5) * bg_step;
+            let sector = (angle_mid * sides_f / TAU).floor() as i32;
+            let (oc, cc) = if sector.rem_euclid(2) == 0 {
+                (bg_a_lit, bg_a_ctr)
+            } else {
+                (bg_b_lit, bg_b_ctr)
+            };
+            push_wedge_gradient(out, a0, bg_step, BG_OUTER_R, cc, oc);
         }
 
         // 2. Pulse echoes (audio onsets and shield breaks).
@@ -859,16 +1190,22 @@ impl Game {
         let wall_color = mix_color(wall_base, [1.0, 0.10, 0.10], dead_t);
 
         // Predictive highlight: which wall is the player aimed at?
+        // Uses angular containment so the highlight tracks
+        // correctly on any polygon count.
         let mut highlight_idx: Option<usize> = None;
         if self.highlight_enabled() {
-            let mut a = self.player_ang % TAU;
-            if a < 0.0 { a += TAU; }
-            let mut ps = (a / SLOT_ANGLE) as i32;
-            if ps < 0 { ps += SLOTS as i32; }
-            let ps = (ps as u32) % SLOTS;
+            let player_ang_norm = self.player_ang.rem_euclid(TAU);
             let mut nearest: Option<(usize, f32)> = None;
             for (i, w) in self.walls.iter().enumerate() {
-                if w.slot != ps { continue; }
+                let wa_start = w.angle_start.rem_euclid(TAU);
+                let wa_end   = wa_start + w.angle_span;
+                let in_slot = if wa_end <= TAU {
+                    player_ang_norm >= wa_start && player_ang_norm < wa_end
+                } else {
+                    player_ang_norm >= wa_start
+                        || player_ang_norm < (wa_end - TAU)
+                };
+                if !in_slot { continue; }
                 let d = w.distance - PLAYER_RADIUS;
                 if d <= 0.0 { continue; }
                 if nearest.map_or(true, |(_, bd)| d < bd) {
@@ -879,8 +1216,8 @@ impl Game {
         }
 
         for (i, w) in self.walls.iter().enumerate() {
-            let a0 = w.slot as f32 * SLOT_ANGLE + cam_fg;
-            let a1 = a0 + SLOT_ANGLE;
+            let a0 = w.angle_start + cam_fg;
+            let a1 = w.angle_start + w.angle_span + cam_fg;
             let r0 = self.radial_depth(w.distance);
             let r1 = self.radial_depth(w.distance + w.thickness);
 
@@ -958,30 +1295,48 @@ impl Game {
             }
         }
 
-        // 7. Center disk + ring.
+        // 7. Center disk + ring. Both are rendered as a triangle
+        //    fan of `CENTER_FAN` segments whose outer radius at
+        //    each angle is computed from the current fractional
+        //    side count. This makes the center shape morph
+        //    smoothly between any two polygons.
+        const CENTER_FAN: u32 = 72;
+        let center_step = TAU / CENTER_FAN as f32;
         let center_outer = CENTER_OUTER + CENTER_PULSE_AMP * pulse;
-        let fill_color   = rotate_hue(self.palette.center_fill, hue);
-        for s in 0..SLOTS {
-            let a0 = s as f32 * SLOT_ANGLE + cam_fg;
-            push_wedge(out, a0, SLOT_ANGLE, center_outer, fill_color);
+        let fill_color = rotate_hue(self.palette.center_fill, hue);
+        for s in 0..CENTER_FAN {
+            let a_local_0 = s as f32 * center_step;
+            let a_local_1 = (s + 1) as f32 * center_step;
+            let r0 = polygon_radius_at(a_local_0, sides_f, center_outer);
+            let r1 = polygon_radius_at(a_local_1, sides_f, center_outer);
+            let a0 = a_local_0 + cam_fg;
+            let a1 = a_local_1 + cam_fg;
+            push_wedge_varying(out, a0, a1, r0, r1, fill_color);
         }
+
         let ring_base  = rotate_hue(self.palette.center_ring, hue);
         let ring_color = mix_color(ring_base, [1.0, 0.20, 0.20], dead_t);
-        for s in 0..SLOTS {
-            let a0 = s as f32 * SLOT_ANGLE + cam_fg;
-            let a1 = a0 + SLOT_ANGLE;
-            push_quad_polar(out, a0, a1,
-                center_outer, center_outer + CENTER_RING, ring_color);
+        for s in 0..CENTER_FAN {
+            let a_local_0 = s as f32 * center_step;
+            let a_local_1 = (s + 1) as f32 * center_step;
+            let r_inner_0 = polygon_radius_at(a_local_0, sides_f, center_outer);
+            let r_inner_1 = polygon_radius_at(a_local_1, sides_f, center_outer);
+            let r_outer_0 = r_inner_0 + CENTER_RING;
+            let r_outer_1 = r_inner_1 + CENTER_RING;
+            let a0 = a_local_0 + cam_fg;
+            let a1 = a_local_1 + cam_fg;
+            push_quad_polar_varying(out, a0, a1,
+                r_inner_0, r_inner_1, r_outer_0, r_outer_1, ring_color);
         }
 
         // 8. Ability indicators.
-        if matches!(self.cfg_ability, Ability::Shield) {
+        if matches!(self.active_ability(), Ability::Shield) {
             let r = center_outer + CENTER_RING + 0.01;
             let a = 0.20 + 0.60 * self.shield_charge;
             push_ring_circle_alpha(
                 out, 0.0, 0.0, r + 0.006, r, [0.55, 0.85, 1.0], a, 48);
         }
-        if matches!(self.cfg_ability, Ability::Dash) {
+        if matches!(self.active_ability(), Ability::Dash) {
             let r = center_outer + CENTER_RING + 0.01;
             let ready = 1.0 - self.dash_cooldown_ratio();
             let col = [0.6 + 0.4 * ready, 0.9, 0.6];
@@ -990,17 +1345,25 @@ impl Game {
         }
 
         // 9. Radial warning. When the nearest wall in the player's
-        //    own slot is dangerously close, pulse a red ring just
-        //    outside the center.
+        //    current angular slot is dangerously close, pulse a red
+        //    ring just outside the center disk. Works regardless of
+        //    how many sides the current polygon has.
         if self.is_alive() {
-            let mut ps = (self.player_ang.rem_euclid(TAU) / SLOT_ANGLE) as i32;
-            if ps < 0 { ps += SLOTS as i32; }
-            let ps = (ps as u32) % SLOTS;
+            let sides = self.generator.sides().max(3);
+            let slot_angle = TAU / sides as f32;
+            let player_ang_norm = self.player_ang.rem_euclid(TAU);
+            let ps = (player_ang_norm / slot_angle) as u32 % sides;
+            let player_slot_center = (ps as f32 + 0.5) * slot_angle;
             let mut min_d = f32::MAX;
             for w in &self.walls {
-                if w.slot != ps { continue; }
-                let d = w.distance - (PLAYER_RADIUS + PLAYER_HEIGHT);
-                if d > 0.0 && d < min_d { min_d = d; }
+                let wa_center = (w.angle_start + w.angle_span * 0.5)
+                    .rem_euclid(TAU);
+                let mut diff = (wa_center - player_slot_center).abs();
+                if diff > TAU * 0.5 { diff = TAU - diff; }
+                if diff < slot_angle * 0.5 {
+                    let d = w.distance - (PLAYER_RADIUS + PLAYER_HEIGHT);
+                    if d > 0.0 && d < min_d { min_d = d; }
+                }
             }
             if min_d < 0.30 {
                 let intensity = 1.0 - (min_d / 0.30).clamp(0.0, 1.0);
@@ -1017,11 +1380,13 @@ impl Game {
         //     in the direction of the player's current turn. Helps
         //     the player commit to the jump.
         if self.is_alive()
-            && matches!(self.cfg_ability, Ability::Dash)
+            && matches!(self.active_ability(), Ability::Dash)
             && self.dash_cooldown <= 0.0
         {
+            let sides = self.generator.sides().max(3);
+            let slot_angle = TAU / sides as f32;
             let dir = if self.player_ang_vel >= 0.0 { 1.0 } else { -1.0 };
-            let target_ang = self.player_ang + SLOT_ANGLE * dir + cam_fg;
+            let target_ang = self.player_ang + slot_angle * dir + cam_fg;
             let pc = self.palette.player;
             let r_tip  = PLAYER_RADIUS + PLAYER_HEIGHT;
             let r_base = PLAYER_RADIUS;
@@ -1117,6 +1482,20 @@ impl Game {
                 [1.0, 1.0, 1.0], alpha);
         }
 
+        // Bassdrop flash. Composite trigger fades a white full
+        // screen overlay proportional to its current strength.
+        let flash_bd = self.generator.flash_alpha();
+        if flash_bd > 0.001 && !self.cfg_reduce_motion {
+            let r = BG_OUTER_R;
+            let alpha = flash_bd * 0.55;
+            out.push(Vertex::rgba([-r, -r], [1.0, 1.0, 1.0], alpha));
+            out.push(Vertex::rgba([ r, -r], [1.0, 1.0, 1.0], alpha));
+            out.push(Vertex::rgba([ r,  r], [1.0, 1.0, 1.0], alpha));
+            out.push(Vertex::rgba([-r, -r], [1.0, 1.0, 1.0], alpha));
+            out.push(Vertex::rgba([ r,  r], [1.0, 1.0, 1.0], alpha));
+            out.push(Vertex::rgba([-r,  r], [1.0, 1.0, 1.0], alpha));
+        }
+
         // 17. Close-call counter HUD. Pinned near the top-left of
         //     the default 16:9 visible area. Ultra-wide displays
         //     render it slightly inboard which is fine because
@@ -1126,6 +1505,28 @@ impl Game {
             let text = format!("CLOSE: {}", self.close_call_count);
             let px = 0.0050 * self.cfg_ui_scale;
             push_text(out, &text, -1.55, -0.95, px, self.palette.accent);
+        }
+        // Authoring reminder: `#[ignore_collisions]` silently
+        // neuters death. Drawn as a small warm-red chip in the
+        // bottom-left so an author never loses track of it while
+        // iterating.
+        if self.ignore_collisions {
+            let label = "NO CLIP";
+            let px = 0.0060 * self.cfg_ui_scale;
+            let w = text_width(label, px);
+            let margin = 0.035;
+            let x = -1.55 + margin;
+            let y = 0.88 + margin;
+            // Soft dim background so the label stays legible on
+            // bright palettes without needing to outline every
+            // glyph.
+            let pad = 0.010;
+            push_quad_polar_alpha_block(
+                out,
+                x - pad, y - pad * 0.5,
+                x + w + pad, y + text_height(px) + pad * 0.5,
+                [0.18, 0.05, 0.08], 0.55);
+            push_text(out, label, x, y, px, [1.0, 0.40, 0.45]);
         }
     }
 
@@ -1328,4 +1729,92 @@ fn push_radial_streak(
     out.push(Vertex::rgba([px0 - perp_x, py0 - perp_y], color, alpha));
     out.push(Vertex::rgba([px1 + perp_x, py1 + perp_y], color, 0.0));
     out.push(Vertex::rgba([px1 - perp_x, py1 - perp_y], color, 0.0));
+}
+
+/// Triangle fan segment with varying outer radius at each
+/// end. Used by the center polygon renderer so the polygon
+/// shape traces out correctly for any fractional side count.
+fn push_wedge_varying(
+    out: &mut Vec<Vertex>, a0: f32, a1: f32,
+    r0: f32, r1: f32, color: [f32; 3],
+) {
+    out.push(Vertex::opaque([0.0, 0.0], color));
+    out.push(Vertex::opaque([a0.cos() * r0, a0.sin() * r0], color));
+    out.push(Vertex::opaque([a1.cos() * r1, a1.sin() * r1], color));
+}
+
+/// Annular quad where inner and outer radii differ between
+/// the two angular bounds. Used for the center ring when
+/// the underlying polygon has a non-uniform radius.
+fn push_quad_polar_varying(
+    out: &mut Vec<Vertex>, a0: f32, a1: f32,
+    r_inner_0: f32, r_inner_1: f32,
+    r_outer_0: f32, r_outer_1: f32,
+    color: [f32; 3],
+) {
+    let p00 = [a0.cos() * r_inner_0, a0.sin() * r_inner_0];
+    let p01 = [a1.cos() * r_inner_1, a1.sin() * r_inner_1];
+    let p10 = [a0.cos() * r_outer_0, a0.sin() * r_outer_0];
+    let p11 = [a1.cos() * r_outer_1, a1.sin() * r_outer_1];
+    out.push(Vertex::opaque(p00, color));
+    out.push(Vertex::opaque(p01, color));
+    out.push(Vertex::opaque(p11, color));
+    out.push(Vertex::opaque(p00, color));
+    out.push(Vertex::opaque(p11, color));
+    out.push(Vertex::opaque(p10, color));
+}
+
+/// Distance from origin to the edge of a regular polygon
+/// with `n` sides inscribed in a circle of radius `r`,
+/// evaluated at angle `theta` (in radians, measured from
+/// +X axis). Integer `n` gives a crisp polygon outline;
+/// fractional `n` linearly interpolates the radii of the
+/// two nearest integer shapes so a runtime morph reads as
+/// a smooth transition.
+///
+/// Minimum is clamped to `n >= 3` because anything lower
+/// does not describe a closed polygon.
+fn polygon_radius_at(theta: f32, n: f32, r: f32) -> f32 {
+    let n_clamped = n.max(3.0);
+    let n_lo = n_clamped.floor();
+    let n_hi = n_lo + 1.0;
+    let t = n_clamped - n_lo;
+    let r_lo = poly_r_integer(theta, n_lo, r);
+    let r_hi = poly_r_integer(theta, n_hi, r);
+    r_lo * (1.0 - t) + r_hi * t
+}
+
+/// Closed form radius for an integer regular polygon.
+/// Algorithm: figure out which edge the direction `theta`
+/// crosses, measure the angle between that direction and
+/// the edge midpoint, then use `R * cos(pi/n) / cos(phi)`
+/// where `phi` is that relative angle.
+fn poly_r_integer(theta: f32, n: f32, r: f32) -> f32 {
+    let two_pi = TAU;
+    let t = theta.rem_euclid(two_pi);
+    let k = (t * n / two_pi).floor();
+    let theta_local = t - two_pi * (k + 0.5) / n;
+    // Defensive floor on the denominator. For valid theta
+    // the cos is already bounded away from zero, but a
+    // clamp stops a bad float from producing infinity.
+    let denom = theta_local.cos().max(0.05);
+    r * (std::f32::consts::PI / n).cos() / denom
+}
+
+/// Axis-aligned translucent block. The existing
+/// `push_quad_polar*` helpers all operate in polar space;
+/// this variant takes four screen-space coordinates so
+/// HUD chips can draw on top of the playfield without
+/// fighting the radial geometry.
+fn push_quad_polar_alpha_block(
+    out: &mut Vec<Vertex>,
+    x0: f32, y0: f32, x1: f32, y1: f32,
+    color: [f32; 3], alpha: f32,
+) {
+    out.push(Vertex::rgba([x0, y0], color, alpha));
+    out.push(Vertex::rgba([x1, y0], color, alpha));
+    out.push(Vertex::rgba([x1, y1], color, alpha));
+    out.push(Vertex::rgba([x0, y0], color, alpha));
+    out.push(Vertex::rgba([x1, y1], color, alpha));
+    out.push(Vertex::rgba([x0, y1], color, alpha));
 }

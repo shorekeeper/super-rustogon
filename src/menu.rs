@@ -1,66 +1,65 @@
 //! Application shell: intro, main menu, level browser, options.
 //!
-//! Layout is fully aspect aware. On entry to `update` we snapshot
-//! the current framebuffer aspect into `view_aspect`, then all
-//! drawing and hit testing routes through `view_left` / `view_right`
-//! / `view_top` / `view_bottom` helpers so content can be pinned to
-//! the true screen edges.
+//! Anchor-driven layout. Every widget rectangle is built via
+//! `Layout::anchor_rect_ndc` (or composed from the cached
+//! viewport edges in `self.ui.layout`) so the screen adapts
+//! to any aspect ratio without the menu code re-deriving the
+//! aspect math itself. Magic Y constants from earlier
+//! revisions (HEADER_Y, MOD_SEPARATOR_Y, ...) became inward
+//! offsets from the corresponding viewport edge: 0.10 from
+//! the top, 0.22 from the bottom, etc. The visible game-space
+//! coordinates of the legacy renderer are reproduced bit for
+//! bit at 16:9, while ultrawide and portrait monitors now see
+//! the same panels positioned correctly relative to their own
+//! visible edges instead of clipped or floating in space.
 //!
-//! Music panel:
+//! The screen state machine and the public API are unchanged
+//! from earlier revisions: `AppState` drives screen routing,
+//! `EditorBoot` carries the editor handoff, `AudioSnapshot`
+//! brings audio state in once per frame.
 //!
-//! * Always visible as a thin peek bar along the very top when a
-//!   track is loaded.
-//! * Hovering the pointer inside the panel's currently drawn
-//!   rectangle opens it (slides down). Moving the pointer below
-//!   closes it. Trigger zone tracks the live drawn bottom so
-//!   there is no phantom hit box above or below the drawn panel.
-//! * Full content (now playing / controls / progress) appears
-//!   only once the panel is mostly open and fades in with the
-//!   slide to avoid drawing text outside the visible rect.
+//! Widget lifecycle: `update()` snapshots input through
+//! `Ui::begin_frame`, runs the active screen which writes
+//! geometry into the Ui's per-frame buffers, and updates the
+//! music panel. `build_geometry()` drains those buffers into
+//! the caller's shape and text vertex vectors. The split is
+//! preserved so main.rs does not have to change.
 //!
-//! Level browser layout:
+//! Music panel: always visible as a thin peek bar along the
+//! viewport top when a track is loaded; opens on hover into
+//! the panel rectangle, closes when the pointer leaves.
+//! Trigger zone tracks the live drawn bottom edge so there is
+//! no phantom hit area.
 //!
-//!   +-----------------------------------------------+
-//!   | (sliding top panel)                           |
-//!   |                                               |
-//!   | [BACK]  SELECT A LEVEL        +----------+    |
-//!   |         UP / DOWN ...         |   CARD   |    |
-//!   |                   \           |          |    |
-//!   |    01 HEXAGON      \          |          |    |
-//!   |    02 HEXAGONER     \         |          |    |
-//!   |    03 HEXAGONEST     \        +----------+    |
-//!   |                       \                       |
-//!   |-----------------------+-----------------------|
-//!   | [RANDOM] [MODIFIER] [MODIFIER] [...]          |
-//!   +-----------------------------------------------+
+//! Level browser: BACK button on the left, header text next
+//! to it, slanted accent rail filling the centre band, level
+//! card on the right of the rail, modifier strip pinned to
+//! the bottom. The slanted accent line runs from
+//! `RAIL_RIGHT_TOP` at the top separator to
+//! `RAIL_RIGHT_BOTTOM` at the bottom separator; rail row
+//! right edges are computed from the same line so they never
+//! drift away from it.
 //!
-//! The slanted accent line runs from `RAIL_RIGHT_TOP` at
-//! `RAIL_TOP` to `RAIL_RIGHT_BOTTOM` at `MOD_ROW_TOP`, passing
-//! through the separator that divides the browser from the
-//! modifier strip. Row right edges are computed from the same
-//! line so they never drift away from it.
-//!
-//! Settings screen (new in this revision):
-//!
-//! The three-slider settings screen was replaced by a tabbed
-//! layout so the extended configuration (graphics knobs, audio
-//! mix, abilities, accessibility) fits without scrolling. The
-//! rest of the menu visually matches the previous version to the
-//! pixel.
-
-use std::collections::HashMap;
+//! Settings: tabbed layout (graphics, audio, gameplay,
+//! accessibility, controls). Each tab is a flat list of rows
+//! drawn by menu-local helpers so the visual tuning of the
+//! previous revision (track padding, arrow lean, hex handle
+//! size) is preserved exactly.
 
 use crate::audio::Audio;
 use crate::config::{
-    Ability, ColorblindMode, Config, HighlightMode, ParticleDensity, VsyncMode,
+    Ability, ColorblindMode, Config, CustomShaders, HighlightMode,
+    ParticleDensity, VsyncMode,
 };
+use crate::font::{self, TextVertex};
 use crate::levels::Palette;
 use crate::pipeline::Vertex;
-use crate::text::{
-    push_text, push_text_alpha, push_text_centered,
-    push_text_centered_alpha, push_text_right,
-    push_text_wrapped, text_width, text_height,
+use crate::ui::draw::{
+    push_hex, push_hex_alpha, push_hex_ring, push_hex_ring_alpha,
+    push_hex_ring_rot, push_hex_rot, push_outline, push_outline_alpha,
+    push_quad, push_quad_alpha, push_tri, push_tri_alpha,
 };
+use crate::ui::{mix3, smoothstep, Anchor, Rect, Ui};
 use crate::win32::{Input, Mouse};
 
 const TAU: f32 = std::f32::consts::TAU;
@@ -85,10 +84,11 @@ pub enum AppState {
 
 type WidgetId = u32;
 
-// ----- original (preserved) widget ids -----
+// ----- widget ids, preserved from the original revision -----
 const ID_PLAY:        WidgetId = 1;
 const ID_OPTIONS:     WidgetId = 2;
 const ID_QUIT:        WidgetId = 3;
+const ID_EDITOR:      WidgetId = 4;
 const ID_BACK:        WidgetId = 10;
 const ID_RESET:       WidgetId = 11;
 const ID_PLAY_LEVEL:  WidgetId = 12;
@@ -99,16 +99,12 @@ const ID_MUSIC_STOP:  WidgetId = 301;
 const ID_MUSIC_BAR:   WidgetId = 302;
 fn id_level_row(i: usize) -> WidgetId { 1000 + i as WidgetId }
 
-// ----- new settings widget ids -----
-// Tabs.
 const ID_TAB_GFX: WidgetId = 400;
 const ID_TAB_AUD: WidgetId = 401;
 const ID_TAB_GPL: WidgetId = 402;
 const ID_TAB_ACC: WidgetId = 403;
 const ID_TAB_CTL: WidgetId = 404;
 
-// Graphics tab widgets. Cycle widgets occupy two ids (left / right
-// arrow hit boxes) so hover easing tracks them independently.
 const ID_GFX_VSYNC_L:    WidgetId = 410;
 const ID_GFX_VSYNC_R:    WidgetId = 411;
 const ID_GFX_FPS_L:      WidgetId = 412;
@@ -123,13 +119,13 @@ const ID_GFX_PART_L:     WidgetId = 420;
 const ID_GFX_PART_R:     WidgetId = 421;
 const ID_GFX_SCANLINES:  WidgetId = 422;
 const ID_GFX_SHOW_FPS:   WidgetId = 423;
+const ID_GFX_SHADERS_L:  WidgetId = 424;
+const ID_GFX_SHADERS_R:  WidgetId = 425;
 
-// Audio tab widgets.
 const ID_AUD_MASTER: WidgetId = 440;
 const ID_AUD_MUSIC:  WidgetId = 441;
 const ID_AUD_SFX:    WidgetId = 442;
 
-// Gameplay tab widgets.
 const ID_GPL_PSPEED:    WidgetId = 450;
 const ID_GPL_WOBBLE:    WidgetId = 451;
 const ID_GPL_ABILITY_L: WidgetId = 452;
@@ -138,22 +134,30 @@ const ID_GPL_CLOSE_FX:  WidgetId = 454;
 const ID_GPL_HL_L:      WidgetId = 455;
 const ID_GPL_HL_R:      WidgetId = 456;
 
-// Accessibility tab widgets.
 const ID_ACC_CONTRAST: WidgetId = 470;
 const ID_ACC_REDUCE:   WidgetId = 471;
 const ID_ACC_HITBOX:   WidgetId = 472;
 const ID_ACC_CB_L:     WidgetId = 473;
 const ID_ACC_CB_R:     WidgetId = 474;
 
-// Typography.
-const TITLE_PX:  f32 = 0.013;
-const H1_PX:     f32 = 0.010;
-const H2_PX:     f32 = 0.007;
-const BUTTON_PX: f32 = 0.010;
-const BODY_PX:   f32 = 0.005;
-const SMALL_PX:  f32 = 0.0045;
+// ----- typography -----
+//
+// The legacy renderer used a 5x7 bitmap font and expressed
+// every text size as `pixel_size`, the side length of one
+// glyph pixel. The visible glyph height was always
+// `7 * pixel_size`. The SDF font's `pixel_size` argument is
+// instead an em height. A multiplier of 8 takes a legacy
+// pixel_size to an em that produces the same visual height.
 
-// Palette defaults.
+const FONT_SCALE: f32 = 8.0;
+const TITLE_PX:  f32 = 0.013  * FONT_SCALE;
+const H1_PX:     f32 = 0.010  * FONT_SCALE;
+const H2_PX:     f32 = 0.007  * FONT_SCALE;
+const BUTTON_PX: f32 = 0.010  * FONT_SCALE;
+const BODY_PX:   f32 = 0.005  * FONT_SCALE;
+const SMALL_PX:  f32 = 0.0045 * FONT_SCALE;
+
+// ----- palette -----
 const ACCENT:      [f32; 3] = [1.00, 0.45, 0.75];
 const ACCENT_HI:   [f32; 3] = [1.00, 0.80, 0.92];
 const DIM:         [f32; 3] = [0.55, 0.42, 0.52];
@@ -162,11 +166,11 @@ const BG_PANEL:    [f32; 3] = [0.10, 0.04, 0.15];
 const BG_PANEL_HI: [f32; 3] = [0.22, 0.10, 0.30];
 const BG_DEEP:     [f32; 3] = [0.03, 0.01, 0.06];
 
-// Main menu bars.
+// ----- main menu bars (centred on screen) -----
 const BAR_HW: f32 = 0.46;
 const BAR_HH: f32 = 0.075;
 
-// Music panel slide geometry.
+// ----- music panel slide -----
 const PANEL_PEEK_HEIGHT:     f32 = 0.028;
 const PANEL_EXTENDED_HEIGHT: f32 = 0.26;
 const PANEL_SLIDE_EASE:      f32 = 14.0;
@@ -174,32 +178,74 @@ const PANEL_CONTENT_LO:      f32 = 0.55;
 const PANEL_CONTENT_HI:      f32 = 0.95;
 const PANEL_INPUT_THRESHOLD: f32 = 0.60;
 
-// Level browser geometry.
-const HEADER_Y:          f32 = -0.90;
-const TOP_SEPARATOR_Y:   f32 = -0.74;
-const RAIL_TOP:          f32 = TOP_SEPARATOR_Y;
-const RAIL_BOT:          f32 =  0.76;
+// ----- screen-band offsets from the viewport edges -----
+//
+// The legacy revision baked these as absolute Y values
+// against a 16:9 viewport (HEADER_Y = -0.90, MOD_SEPARATOR_Y
+// = 0.78, etc). They were broken on portrait or ultrawide
+// displays. Re-expressed as inward distances from the
+// nearest edge they collapse to identity on 16:9 and stay
+// proportionally correct everywhere else.
+
+/// Distance from `view_top` to the centre of the BACK / RESET
+/// button row and the screen titles.
+const HEADER_BAND_Y: f32 = 0.10;
+/// Distance from `view_top` to the top separator line of the
+/// level select rail.
+const TOP_SEPARATOR_Y_INSET: f32 = 0.26;
+/// Distance from `view_bottom` to the separator line that
+/// divides the rail from the modifier strip.
+const MOD_SEPARATOR_Y_INSET: f32 = 0.22;
+/// Distance from `view_bottom` to the top edge of the
+/// modifier row.
+const MOD_ROW_TOP_INSET: f32 = 0.20;
+/// Distance from `view_bottom` to the bottom edge of the
+/// modifier row.
+const MOD_ROW_BOT_INSET: f32 = 0.06;
+/// Distance from `view_top` to the centre of the settings
+/// tab bar.
+const TAB_BAR_Y_INSET: f32 = 0.24;
+/// Distance from `view_top` to the top edge of the settings
+/// content band.
+const SETTINGS_TOP_INSET: f32 = 0.36;
+/// Distance from `view_bottom` to the bottom edge of the
+/// settings content band.
+const SETTINGS_BOT_INSET: f32 = 0.18;
+/// Distance from `view_top` to the centre of the settings
+/// "OPTIONS" title.
+const SETTINGS_TITLE_INSET: f32 = 0.08;
+/// Distance from `view_top` to the centre of the settings
+/// subtitle line "TUNE THE FEEL".
+const SETTINGS_SUBTITLE_INSET: f32 = 0.16;
+/// Distance from `view_top` to the main menu title.
+const MAIN_TITLE_Y_INSET: f32 = 0.20;
+/// Distance from `view_bottom` to the main menu footer line.
+const MAIN_FOOTER_INSET: f32 = 0.06;
+/// Distance from `view_bottom` to the intro "click to skip"
+/// hint.
+const INTRO_HINT_INSET: f32 = 0.15;
+
+// ----- rail diagonal -----
+//
+// Slope endpoints of the slanted accent edge that runs
+// through the level select panel. Stored relative to the
+// viewport centre because the diagonal is what gives the
+// screen its visual identity; pulling these to the edges
+// would lose the slant.
+
 const RAIL_RIGHT_TOP:    f32 = -0.30;
 const RAIL_RIGHT_BOTTOM: f32 =  0.55;
 const RAIL_EXTEND_LEFT:  f32 =  5.00;
-const MOD_SEPARATOR_Y:   f32 =  0.78;
-const MOD_ROW_TOP:       f32 =  0.80;
-const MOD_ROW_BOT:       f32 =  0.94;
 
-// Row geometry.
+// ----- level row geometry -----
 const ROW_HH:      f32 = 0.070;
 const ROW_SPACING: f32 = 0.155;
 
-// Card geometry.
+// ----- card geometry -----
 const CARD_WIDTH: f32 = 1.20;
 
-// Settings screen geometry.
-const SETTINGS_TAB_Y:       f32 = -0.76;
-const SETTINGS_TAB_H:       f32 =  0.050;
-const SETTINGS_CONTENT_TOP: f32 = -0.64;
-const SETTINGS_CONTENT_BOT: f32 =  0.82;
-
-const ID_EDITOR: WidgetId = 4;
+// ----- palette tween -----
+const PALETTE_EASE_RATE: f32 = 6.0;
 
 struct MainItem { label: &'static str, sub: &'static str, id: WidgetId }
 const MAIN_ITEMS: &[MainItem] = &[
@@ -209,17 +255,19 @@ const MAIN_ITEMS: &[MainItem] = &[
     MainItem { label: "QUIT",    sub: "EXIT TO DESKTOP",  id: ID_QUIT    },
 ];
 
-const HOVER_EASE_RATE:   f32 = 14.0;
-const PALETTE_EASE_RATE: f32 = 6.0;
-
-/// Choice handed to the editor on entry. Set by the menu, read
-/// once by main.rs when the editor is constructed, then reset.
+/// Boot directive handed from the menu to the editor when
+/// the editor screen is entered. New means start with a
+/// blank draft; Existing carries an index into the level
+/// catalogue so the editor opens with that level's AST.
 pub enum EditorBoot {
     New,
     Existing(u32),
 }
 
-/// Snapshot of audio state polled once per frame.
+/// Per-frame audio snapshot. Built once at the top of the
+/// frame in main.rs and passed in to every consumer that
+/// needs to read audio state without triggering atomics
+/// multiple times itself.
 pub struct AudioSnapshot {
     pub position:      f32,
     pub duration:      f32,
@@ -238,27 +286,20 @@ pub struct Menu {
     last_onset_time: f32,
     prev_onset_counter: u32,
 
-    pointer: (f32, f32),
-    left_was_down: bool,
-    up_edge_was: bool,
-    down_edge_was: bool,
-    enter_edge_was: bool,
-
-    dragging: Option<WidgetId>,
-
     selected: u32,
     difficulty_idx: Vec<u32>,
-
-    hover:         HashMap<WidgetId, f32>,
-    hover_target:  HashMap<WidgetId, bool>,
 
     theme_bg_a:   [f32; 3],
     theme_bg_b:   [f32; 3],
     theme_accent: [f32; 3],
 
-    view_aspect: f32,
-    editor_boot: Option<EditorBoot>,
     panel_t: f32,
+    editor_boot: Option<EditorBoot>,
+
+    /// Immediate-mode UI context. Owns the per-widget hover
+    /// map, drag tracker, input snapshot, layout, and the
+    /// per-frame shape and text geometry buffers.
+    ui: Ui,
 }
 
 impl Menu {
@@ -276,42 +317,42 @@ impl Menu {
             intro_time: 0.0,
             last_onset_time: -1.0,
             prev_onset_counter: 0,
-            pointer: (0.0, 0.0),
-            left_was_down: false,
-            up_edge_was: false,
-            down_edge_was: false,
-            enter_edge_was: false,
-            dragging: None,
             selected: 0,
             difficulty_idx,
-            hover: HashMap::new(),
-            hover_target: HashMap::new(),
             theme_bg_a:   BG_PANEL,
             theme_bg_b:   BG_DEEP,
             theme_accent: ACCENT,
-            view_aspect: 16.0 / 9.0,
             panel_t: 0.0,
             editor_boot: None,
+            ui: Ui::new(),
         }
     }
 
     pub fn state(&self)          -> AppState { self.state }
     pub fn selected_level(&self) -> u32      { self.selected }
 
-    /// Track the main loop should currently be playing.
     pub fn desired_music(&self) -> Option<String> {
         match self.state {
             AppState::Intro    => Some(MENU_ENTER_MUSIC_PATH.to_string()),
-            AppState::MainMenu | AppState::Settings => Some(MENU_MUSIC_PATH.to_string()),
+            AppState::MainMenu | AppState::Settings =>
+                Some(MENU_MUSIC_PATH.to_string()),
             AppState::LevelSelect => {
                 let lvl = crate::levels::get(self.selected);
-                if lvl.music_path.is_empty() { None } else { Some(lvl.music_path.clone()) }
+                if lvl.music_path.is_empty() {
+                    None
+                } else {
+                    Some(lvl.music_path.clone())
+                }
             }
             AppState::Editor | AppState::EditorPlay { .. } =>
                 Some(MENU_MUSIC_PATH.to_string()),
             AppState::Playing { level, .. } => {
                 let lvl = crate::levels::get(level);
-                if lvl.music_path.is_empty() { None } else { Some(lvl.music_path.clone()) }
+                if lvl.music_path.is_empty() {
+                    None
+                } else {
+                    Some(lvl.music_path.clone())
+                }
             }
             AppState::Quit => None,
         }
@@ -319,47 +360,65 @@ impl Menu {
 
     pub fn desired_bpm(&self) -> u32 {
         match self.state {
-            AppState::Intro | AppState::MainMenu
-                | AppState::Settings | AppState::LevelSelect => MENU_BPM,
+            AppState::Intro
+            | AppState::MainMenu
+            | AppState::Settings
+            | AppState::LevelSelect => MENU_BPM,
             AppState::Editor | AppState::EditorPlay { .. } => MENU_BPM,
-            AppState::Playing { level, .. } => crate::levels::get(level).music_bpm,
+            AppState::Playing { level, .. } =>
+                crate::levels::get(level).music_bpm,
             AppState::Quit => MENU_BPM,
         }
     }
 
     pub fn return_to_main(&mut self) {
         self.state = AppState::MainMenu;
-        self.dragging = None;
     }
 
-    // ---------- view bounds ----------
-
-    fn view_left(&self) -> f32 {
-        if self.view_aspect >= 1.0 { -self.view_aspect } else { -1.0 }
-    }
-    fn view_right(&self) -> f32 { -self.view_left() }
-    fn view_top(&self) -> f32 {
-        if self.view_aspect >= 1.0 { -1.0 } else { -1.0 / self.view_aspect }
-    }
-    fn view_bottom(&self) -> f32 { -self.view_top() }
-
-    /// Pop the pending editor boot directive. Called once by
-    /// main.rs when the editor instance is being created.
     pub fn take_editor_boot(&mut self) -> EditorBoot {
         self.editor_boot.take().unwrap_or(EditorBoot::New)
     }
 
-    /// Switch into the play-test sub-state. The editor frame
-    /// stays on the main loop's stack; only the rendering and
-    /// input routing change.
     pub fn enter_editor_play(&mut self, tier_idx: u32) {
         self.state = AppState::EditorPlay { tier_idx };
     }
 
-    /// Return from a play-test back to the editor.
     pub fn return_to_editor(&mut self) {
         self.state = AppState::Editor;
-        self.dragging = None;
+    }
+
+    // ---------- view bound shortcuts ----------
+
+    fn view_left(&self)   -> f32 { self.ui.layout.view_left   }
+    fn view_right(&self)  -> f32 { self.ui.layout.view_right  }
+    fn view_top(&self)    -> f32 { self.ui.layout.view_top    }
+    fn view_bottom(&self) -> f32 { self.ui.layout.view_bottom }
+
+    // ---------- screen-band Y coordinates -----------
+
+    fn header_y(&self) -> f32 {
+        self.view_top() + HEADER_BAND_Y
+    }
+    fn top_separator_y(&self) -> f32 {
+        self.view_top() + TOP_SEPARATOR_Y_INSET
+    }
+    fn mod_separator_y(&self) -> f32 {
+        self.view_bottom() - MOD_SEPARATOR_Y_INSET
+    }
+    fn mod_row_top_y(&self) -> f32 {
+        self.view_bottom() - MOD_ROW_TOP_INSET
+    }
+    fn mod_row_bot_y(&self) -> f32 {
+        self.view_bottom() - MOD_ROW_BOT_INSET
+    }
+    fn tab_bar_y(&self) -> f32 {
+        self.view_top() + TAB_BAR_Y_INSET
+    }
+    fn settings_band_top(&self) -> f32 {
+        self.view_top() + SETTINGS_TOP_INSET
+    }
+    fn settings_band_bot(&self) -> f32 {
+        self.view_bottom() - SETTINGS_BOT_INSET
     }
 
     // ---------- panel geometry ----------
@@ -369,6 +428,134 @@ impl Menu {
         let peek = top + PANEL_PEEK_HEIGHT;
         let ext  = top + PANEL_EXTENDED_HEIGHT;
         peek + (ext - peek) * self.panel_t
+    }
+
+    /// Sample point on the slanted rail accent line at game-
+    /// space Y `y`. Maps from the top separator (t=0) to the
+    /// modifier separator (t=1) along the line interpolated
+    /// between `RAIL_RIGHT_TOP` and `RAIL_RIGHT_BOTTOM`.
+    fn rail_right_at(&self, y: f32) -> f32 {
+        let top = self.top_separator_y();
+        let bot = self.mod_separator_y();
+        let t = ((y - top) / (bot - top)).clamp(0.0, 1.0);
+        RAIL_RIGHT_TOP + (RAIL_RIGHT_BOTTOM - RAIL_RIGHT_TOP) * t
+    }
+
+    // ---------- hit-rect helpers (anchored, return Rect) ----------
+
+    fn back_button_rect(&self) -> Rect {
+        // BACK button anchored to the top-left corner. The
+        // historical (cx=view_left+0.13, cy=view_top+0.10)
+        // position is now an inward offset from the top-left
+        // anchor combined with the centre-relative button
+        // half-extents.
+        self.ui.layout.anchor_rect_ndc(
+            Anchor::TopLeft,
+            0.13 - 0.09, HEADER_BAND_Y - 0.040,
+            0.18, 0.080,
+        )
+    }
+
+    fn reset_button_rect(&self) -> Rect {
+        self.ui.layout.anchor_rect_ndc(
+            Anchor::TopRight,
+            0.15 - 0.09, HEADER_BAND_Y - 0.040,
+            0.18, 0.080,
+        )
+    }
+
+    fn card_rect(&self) -> Rect {
+        // Card pinned to the right edge, height stretches
+        // from just below the music panel peek to just above
+        // the modifier separator.
+        let x1 = self.view_right() - 0.04;
+        let x0 = x1 - CARD_WIDTH;
+        let y0 = self.view_top()  + PANEL_PEEK_HEIGHT + 0.03;
+        let y1 = self.mod_separator_y() - 0.02;
+        Rect { x0, y0, x1, y1 }
+    }
+
+    fn music_panel_bar_range(&self) -> (f32, f32) {
+        // Progress bar inside the music panel. Stays anchored
+        // to the right edge with a generous left margin.
+        let right = self.view_right() - 0.55;
+        let left  = self.view_left()  + 0.80;
+        (left, right)
+    }
+
+    fn tab_rect(&self, i: usize, n: usize) -> Rect {
+        let vl = self.view_left()  + 0.08;
+        let vr = self.view_right() - 0.08;
+        let total = vr - vl;
+        let gap = 0.010;
+        let cell = (total - gap * (n as f32 - 1.0)) / n as f32;
+        let x0 = vl + (cell + gap) * i as f32;
+        let x1 = x0 + cell;
+        let cy = self.tab_bar_y();
+        let hh = 0.050;
+        Rect { x0, y0: cy - hh, x1, y1: cy + hh }
+    }
+
+    fn row_center(&self, row: usize, total: usize) -> (f32, f32) {
+        // Settings-screen content band. Rows are equally
+        // spaced from the top of the band to the bottom; the
+        // first row's centre sits half a row-height below the
+        // top edge.
+        let total = total.max(1);
+        let top = self.settings_band_top();
+        let bot = self.settings_band_bot();
+        let row_h = (bot - top) / total as f32;
+        let cy = top + row_h * (row as f32 + 0.5);
+        (0.0, cy)
+    }
+
+    fn slider_track_range(&self) -> (f32, f32) {
+        let vl = self.view_left() + 0.08;
+        let x0 = vl + 0.52;
+        let x1 = vl + 1.30;
+        (x0, x1)
+    }
+
+    fn arrow_positions(&self) -> (f32, f32) {
+        let vl = self.view_left() + 0.08;
+        let lx = vl + 0.62;
+        let rx = vl + 1.22;
+        (lx, rx)
+    }
+
+    fn toggle_rect(&self, row: usize, rows: usize) -> Rect {
+        let (_, cy) = self.row_center(row, rows);
+        let vl = self.view_left() + 0.08;
+        let cx = vl + 0.92;
+        Rect::from_center(cx, cy, 0.12, 0.032)
+    }
+
+    fn modifier_strip_rect(&self) -> Rect {
+        Rect {
+            x0: self.view_left()  + 0.04,
+            y0: self.mod_row_top_y(),
+            x1: self.view_right() - 0.04,
+            y1: self.mod_row_bot_y(),
+        }
+    }
+
+    fn main_item_rect(&self, i: usize) -> Rect {
+        let (cx, cy) = main_item_pos(i);
+        Rect::from_center(cx, cy, BAR_HW, BAR_HH)
+    }
+
+    fn level_row_rect(&self, i: usize) -> Rect {
+        // Row spans from the left edge to the diagonal accent
+        // line, vertically centred on `row_y(i, selected)`.
+        let y = row_y(i, self.selected);
+        let xr = self.rail_right_at(y);
+        let xl = self.view_left();
+        Rect {
+            x0: xl,
+            y0: y - ROW_HH,
+            x1: xr,
+            y1: y + ROW_HH,
+        }
     }
 
     // ---------- update ----------
@@ -384,7 +571,12 @@ impl Menu {
         config: &mut Config,
     ) {
         self.time += dt;
-        self.view_aspect = (cw.max(1) as f32) / (ch.max(1) as f32);
+
+        // Begin UI frame: snapshot input, recompute layout,
+        // ease last frame's hover targets, clear targets and
+        // geometry buffers.
+        self.ui.begin_frame(dt, mouse, input, cw, ch);
+
         audio.set_volume(config.master_volume);
 
         if snap.onset_counter != self.prev_onset_counter {
@@ -392,32 +584,10 @@ impl Menu {
         }
         self.prev_onset_counter = snap.onset_counter;
 
-        self.hover_target.clear();
-
-        let (sx, sy) = crate::renderer::aspect_scale(cw, ch);
-        let cwf = cw.max(1) as f32;
-        let chf = ch.max(1) as f32;
-        let nx = ((mouse.x as f32 / cwf) * 2.0 - 1.0) / sx;
-        let ny = ((mouse.y as f32 / chf) * 2.0 - 1.0) / sy;
-        self.pointer = (nx, ny);
-
-        let clicked  =  mouse.left_down && !self.left_was_down;
-        let released = !mouse.left_down &&  self.left_was_down;
-        self.left_was_down = mouse.left_down;
-
-        let up_edge    = input.up    && !self.up_edge_was;
-        let down_edge  = input.down  && !self.down_edge_was;
-        let enter_edge = input.enter && !self.enter_edge_was;
-        self.up_edge_was    = input.up;
-        self.down_edge_was  = input.down;
-        self.enter_edge_was = input.enter;
-
-        if released { self.dragging = None; }
-
         // Slide the music panel.
         let want_open = snap.has_music && {
-            let top = self.view_top();
-            ny >= top && ny <= self.panel_bot() + 0.015
+            let py = self.ui.input().pointer.1;
+            py >= self.view_top() && py <= self.panel_bot() + 0.015
         };
         let target_t = if want_open { 1.0 } else { 0.0 };
         let pb = 1.0 - (-PANEL_SLIDE_EASE * dt).exp();
@@ -425,58 +595,45 @@ impl Menu {
         if self.panel_t < 0.0005 { self.panel_t = 0.0; }
         if self.panel_t > 0.9995 { self.panel_t = 1.0; }
 
-        if let Some(id) = self.dragging {
-            // Dragged sliders: handle drag here.
-            self.handle_slider_drag(id, nx, config);
-            if id == ID_MUSIC_BAR {
-                if snap.duration > 0.0 {
-                    let (bx0, bx1) = self.music_panel_bar_range();
-                    let t = ((nx - bx0) / (bx1 - bx0)).clamp(0.0, 1.0);
-                    audio.seek_music(t * snap.duration);
-                }
-            }
-        } else {
-            let panel_hot = snap.has_music
-                && self.panel_t >= PANEL_INPUT_THRESHOLD
-                && ny >= self.view_top()
-                && ny <= self.panel_bot();
-            let panel_handled = if panel_hot {
-                self.tick_music_panel(nx, ny, clicked, audio, snap)
-            } else { false };
-
-            if !panel_handled {
-                match self.state {
-                    AppState::Intro => {
-                        self.intro_time += dt;
-                        if self.intro_time >= INTRO_SECONDS || clicked || enter_edge {
-                            self.state = AppState::MainMenu;
-                        }
-                    }
-                    AppState::MainMenu  => self.tick_main(nx, ny, clicked, audio),
-                    AppState::LevelSelect => self.tick_level_select(
-                        nx, ny, clicked, up_edge, down_edge, enter_edge, audio),
-                    AppState::Settings  => self.tick_settings(nx, ny, clicked, audio, config),
-                    _ => {}
-                }
-            }
+        // Continuous music bar drag (handled before screen
+        // input so a dragging seek is not interrupted).
+        if self.ui.is_dragging(ID_MUSIC_BAR) && snap.duration > 0.0 {
+            let pointer = self.ui.input().pointer;
+            let (bx0, bx1) = self.music_panel_bar_range();
+            let t = ((pointer.0 - bx0) / (bx1 - bx0)).clamp(0.0, 1.0);
+            audio.seek_music(t * snap.duration);
         }
 
-        // Hover easing.
-        let blend = 1.0 - (-HOVER_EASE_RATE * dt).exp();
-        let keys: Vec<WidgetId> = self.hover.keys().copied().collect();
-        for id in keys {
-            let target = if *self.hover_target.get(&id).unwrap_or(&false) { 1.0 } else { 0.0 };
-            let v = self.hover.get_mut(&id).unwrap();
-            *v += (target - *v) * blend;
-            if *v < 0.001 && target == 0.0 { self.hover.remove(&id); }
-        }
-        for (&id, &t) in &self.hover_target {
-            if t && !self.hover.contains_key(&id) {
-                self.hover.insert(id, 0.0);
-            }
+        // Decide who owns pointer input this frame.
+        let panel_hot = snap.has_music
+            && self.panel_t >= PANEL_INPUT_THRESHOLD
+            && self.ui.input().pointer.1 >= self.view_top()
+            && self.ui.input().pointer.1 <= self.panel_bot();
+        let dragging_bar = self.ui.is_dragging(ID_MUSIC_BAR);
+        let screen_input = !panel_hot && !dragging_bar;
+
+        // Background tunnel + orbiting hexes. Always drawn.
+        self.render_background();
+
+        // Active screen.
+        match self.state {
+            AppState::Intro       =>
+                self.render_intro(dt, screen_input),
+            AppState::MainMenu    =>
+                self.render_main(audio, screen_input),
+            AppState::LevelSelect =>
+                self.render_level_select(audio, screen_input),
+            AppState::Settings    =>
+                self.render_settings(audio, config, screen_input),
+            _ => {}
         }
 
-        // Palette ease.
+        // Music panel renders on top so the slide stays
+        // visible no matter what is below.
+        self.render_music_panel(audio, snap);
+
+        // Palette tween toward target. Affects next frame's
+        // background colour.
         let (tga, tgb, tgac) = self.target_palette();
         let pblend = 1.0 - (-PALETTE_EASE_RATE * dt).exp();
         for i in 0..3 {
@@ -496,32 +653,148 @@ impl Menu {
         }
     }
 
-    fn set_hover(&mut self, id: WidgetId, v: bool) {
-        self.hover_target.insert(id, v);
-    }
-
-    fn hover_eased(&self, id: WidgetId) -> f32 {
-        let t = *self.hover.get(&id).unwrap_or(&0.0);
-        let t = t.clamp(0.0, 1.0);
-        t * t * (3.0 - 2.0 * t)
-    }
-
     fn beat_flash(&self) -> f32 {
         if self.last_onset_time < 0.0 { return 0.0; }
         let dt = (self.time - self.last_onset_time).max(0.0);
         (-dt * 7.0).exp()
     }
 
-    // ---------- screen ticks ----------
+    // ---------- background ----------
 
-    fn tick_main(&mut self, nx: f32, ny: f32, clicked: bool, audio: &Audio) {
+    fn render_background(&mut self) {
+        let flash = self.beat_flash();
+        let t = self.time;
+        let theme_bg_a = self.theme_bg_a;
+        let theme_bg_b = self.theme_bg_b;
+        let theme_accent = self.theme_accent;
+
+        let geom = self.ui.geom_mut();
+        let n = 12;
+        let span = TAU / n as f32;
+        let rot = t * 0.04;
+        let a = mix3(theme_bg_a, WHITE, 0.04 * flash);
+        let b = theme_bg_b;
+        for s in 0..n {
+            let a0 = s as f32 * span + rot;
+            let a1 = a0 + span;
+            let color = if s % 2 == 0 { a } else { b };
+            push_tri(geom,
+                [0.0, 0.0],
+                [a0.cos() * BG_OUTER_R, a0.sin() * BG_OUTER_R],
+                [a1.cos() * BG_OUTER_R, a1.sin() * BG_OUTER_R],
+                color);
+        }
+        for i in 0..14 {
+            let f = i as f32 / 14.0;
+            let ang = f * TAU + t * 0.08;
+            let orbit = 1.25 + ((t * 0.20 + f * 6.3).sin() * 0.35);
+            let px = ang.cos() * orbit;
+            let py = ang.sin() * orbit;
+            let r = 0.011 + 0.004 * flash;
+            let c = mix3([0.18, 0.07, 0.16], theme_accent, 0.25);
+            push_hex(geom, px, py, r, c);
+        }
+    }
+
+    // ---------- intro ----------
+
+    fn render_intro(&mut self, dt: f32, consume_input: bool) {
+        if consume_input {
+            let input = self.ui.input();
+            self.intro_time += dt;
+            if self.intro_time >= INTRO_SECONDS
+                || input.left_clicked
+                || input.enter_edge
+            {
+                self.state = AppState::MainMenu;
+            }
+        }
+
+        let t = self.intro_time;
+        let d = INTRO_SECONDS;
+        let fade_in  = smoothstep(0.0, 0.8, t);
+        let fade_out = 1.0 - smoothstep(d - 0.6, d, t);
+        let alpha    = fade_in * fade_out;
+
+        // Geometry block: ring + central hex stack.
+        {
+            let geom = self.ui.geom_mut();
+            let ring_t = smoothstep(0.0, 1.5, t);
+            let ring_r = ring_t * 0.9;
+            let count = 24;
+            for i in 0..count {
+                let ang = i as f32 / count as f32 * TAU;
+                let x = ang.cos() * ring_r;
+                let y = ang.sin() * ring_r;
+                let size = 0.015 * alpha;
+                let col = mix3(BG_DEEP, ACCENT, alpha);
+                push_hex(geom, x, y, size, col);
+            }
+            let contract = 1.0 - 0.1 * smoothstep(d - 0.6, d, t);
+            let r0 = 0.22 * contract;
+            let r1 = 0.15 * contract;
+            let r2 = 0.07 * contract;
+            let tint = |c: [f32; 3]| mix3(BG_DEEP, c, alpha);
+            push_hex_rot     (geom, 0.0, -0.05, r0, tint(BG_PANEL),     t * 0.4);
+            push_hex_ring_rot(geom, 0.0, -0.05, r0, r0 - 0.012, tint(ACCENT),    t * 0.4);
+            push_hex_rot     (geom, 0.0, -0.05, r1, tint(BG_PANEL_HI), -t * 0.9);
+            push_hex_ring_rot(geom, 0.0, -0.05, r1, r1 - 0.010, tint(ACCENT_HI), -t * 0.9);
+            push_hex_rot     (geom, 0.0, -0.05, r2, tint(WHITE),        t * 1.6);
+        }
+
+        let slide = (1.0 - fade_in) * 0.08;
+        let hint_y = self.view_bottom() - INTRO_HINT_INSET;
+        let text = self.ui.text_mut();
+        font::push_text_centered_alpha(text, "SUPER RUSTOGON",
+            0.0, 0.28 + slide, TITLE_PX, ACCENT_HI, alpha);
+        font::push_text_centered_alpha(text, "A HEXAGONAL DESCENT",
+            0.0, 0.42 + slide, H2_PX, WHITE, alpha * 0.7);
+        font::push_text_centered_alpha(text, "CLICK OR ENTER TO SKIP",
+            0.0, hint_y, SMALL_PX, DIM, (alpha * 0.8).max(0.0));
+    }
+
+    // ---------- main menu ----------
+
+    fn render_main(&mut self, audio: &Audio, consume_input: bool) {
+        let pointer = self.ui.input().pointer;
+        let clicked = self.ui.input().left_clicked && consume_input;
+
+        let view_l = self.view_left();
+        let view_r = self.view_right();
+        let view_b = self.view_bottom();
+        let title_y = self.view_top() + MAIN_TITLE_Y_INSET;
+
+        // Title block (drop shadow + main + subtitle).
+        {
+            let text = self.ui.text_mut();
+            font::push_text_centered(text, "SUPER RUSTOGON",
+                0.006, title_y + 0.010, TITLE_PX, BG_DEEP);
+            font::push_text_centered(text, "SUPER RUSTOGON",
+                0.000, title_y, TITLE_PX, ACCENT_HI);
+            font::push_text_centered(text, "A HEXAGONAL DESCENT",
+                0.0, title_y + 0.12, H2_PX, DIM);
+        }
+
+        // Decorative accent bars on either side of the title.
+        let lw = 0.36;
+        {
+            let geom = self.ui.geom_mut();
+            push_quad(geom, -0.52 - lw, title_y + 0.14,
+                -0.52,      title_y + 0.145, ACCENT);
+            push_quad(geom,  0.52,      title_y + 0.14,
+                 0.52 + lw, title_y + 0.145, ACCENT);
+        }
+
+        // Item bars.
+        let mut next_state: Option<AppState> = None;
         for (i, item) in MAIN_ITEMS.iter().enumerate() {
-            let (cx, cy) = main_item_pos(i);
-            let hit = hit_rect(nx, ny, cx, cy, BAR_HW, BAR_HH);
-            self.set_hover(item.id, hit);
+            let rect = self.main_item_rect(i);
+            let hit = rect.contains(pointer.0, pointer.1);
+            let h = self.ui.track_hover(item.id, hit);
+            self.draw_menu_bar(rect, item.label, item.sub, h);
             if hit && clicked {
                 audio.play_interact();
-                self.state = match item.id {
+                next_state = Some(match item.id {
                     ID_PLAY    => AppState::LevelSelect,
                     ID_OPTIONS => AppState::Settings,
                     ID_EDITOR  => {
@@ -530,29 +803,74 @@ impl Menu {
                     }
                     ID_QUIT    => AppState::Quit,
                     _ => self.state,
-                };
-                return;
+                });
+                self.ui.capture_pointer();
+                break;
             }
         }
+        if let Some(s) = next_state { self.state = s; return; }
+
+        // Footer.
+        let foot_y = view_b - MAIN_FOOTER_INSET;
+        let text = self.ui.text_mut();
+        font::push_text(text, "V0.2",
+            view_l + 0.03, foot_y, SMALL_PX, DIM);
+        font::push_text_centered(text, "MUSIC FROM OPENGAMEART",
+            0.0, foot_y, SMALL_PX, DIM);
+        font::push_text_right(text, "ESC TO QUIT",
+            view_r - 0.03, foot_y, SMALL_PX, DIM);
     }
 
-    fn tick_level_select(
+    fn draw_menu_bar(
         &mut self,
-        nx: f32, ny: f32, clicked: bool,
-        up_edge: bool, down_edge: bool, enter_edge: bool,
-        audio: &Audio,
+        rect: Rect,
+        label: &str, sub: &str,
+        h: f32,
     ) {
-        let n = crate::levels::num();
+        let (cx, cy) = rect.center();
+        let slide = h * 0.025;
+        let bg   = mix3(BG_PANEL, BG_PANEL_HI, h);
+        let ring = mix3(ACCENT, ACCENT_HI, h);
+        let x0 = rect.x0 + slide;
+        let x1 = rect.x1 + slide;
+        let y0 = rect.y0;
+        let y1 = rect.y1;
+        let _ = cx;
 
-        let (bcx, bcy, bhw, bhh) = self.back_button_rect();
-        let back_hit = hit_rect(nx, ny, bcx, bcy, bhw, bhh);
-        self.set_hover(ID_BACK, back_hit);
-        if back_hit && clicked {
-            audio.play_interact();
-            self.state = AppState::MainMenu;
-            return;
+        {
+            let geom = self.ui.geom_mut();
+            push_quad(geom, x0, y0, x1, y1, bg);
+            push_quad(geom, x0, y0, x0 + 0.024, y1, ring);
+            if h > 0.01 {
+                push_outline(geom, x0, y0, x1, y1, 0.004 + 0.002 * h, ring);
+                let chev_col = mix3(bg, ring, 0.5 + 0.5 * h);
+                push_tri(geom,
+                    [x1 - 0.075, cy - 0.035],
+                    [x1 - 0.075, cy + 0.035],
+                    [x1 - 0.030, cy],
+                    chev_col);
+            }
         }
 
+        let label_y = cy - font::text_height(BUTTON_PX) * 0.5 - 0.010;
+        let sub_y   = label_y + font::text_height(BUTTON_PX) + 0.010;
+        let text = self.ui.text_mut();
+        font::push_text(text, label, x0 + 0.055, label_y, BUTTON_PX, WHITE);
+        font::push_text(text, sub,   x0 + 0.055, sub_y,   SMALL_PX,  DIM);
+    }
+
+    // ---------- level select ----------
+
+    fn render_level_select(&mut self, audio: &Audio, consume_input: bool) {
+        let n = crate::levels::num();
+        let input = self.ui.input();
+        let pointer = input.pointer;
+        let clicked    = input.left_clicked && consume_input;
+        let up_edge    = input.up_edge      && consume_input;
+        let down_edge  = input.down_edge    && consume_input;
+        let enter_edge = input.enter_edge   && consume_input;
+
+        // Keyboard navigation.
         if up_edge && self.selected > 0 {
             self.selected -= 1;
             audio.play_interact();
@@ -570,692 +888,141 @@ impl Menu {
             return;
         }
 
-        let rail_left = self.view_left();
-        for i in 0..n {
-            let y = row_y(i, self.selected);
-            let id = id_level_row(i);
-            let xr = rail_right_at(y);
-            let hx = (rail_left + xr) * 0.5;
-            let hw = (xr - rail_left) * 0.5;
-            let hit = hit_rect(nx, ny, hx, y, hw, ROW_HH);
-            self.set_hover(id, hit);
-            if hit && clicked {
-                if self.selected == i as u32 {
-                    audio.play_enter();
-                    self.state = AppState::Playing {
-                        level: self.selected,
-                        difficulty_idx: self.difficulty_idx[self.selected as usize],
-                    };
-                    return;
-                }
-                self.selected = i as u32;
-                audio.play_interact();
-                return;
-            }
-        }
-
-        // Difficulty arrows inside the card.
-        let (cx0, _, cx1, _) = self.card_rect();
-        let dcx = (cx0 + cx1) * 0.5;
-        let dy  = 0.38;
-        let lhit = hit_rect(nx, ny, dcx - 0.30, dy, 0.06, 0.05);
-        let rhit = hit_rect(nx, ny, dcx + 0.30, dy, 0.06, 0.05);
-        self.set_hover(ID_DIFF_LEFT, lhit);
-        self.set_hover(ID_DIFF_RIGHT, rhit);
-        if lhit && clicked {
-            audio.play_interact();
-            let di = &mut self.difficulty_idx[self.selected as usize];
-            if *di > 0 { *di -= 1; }
-        }
-        if rhit && clicked {
-            audio.play_interact();
-            let lvl = crate::levels::get(self.selected);
-            let di = &mut self.difficulty_idx[self.selected as usize];
-            if (*di as usize) + 1 < lvl.difficulty_tiers.len() { *di += 1; }
-        }
-
-        // PLAY button inside the card.
-        let pcx = dcx;
-        let pcy = self.card_rect().3 - 0.08;
-        let phit = hit_rect(nx, ny, pcx, pcy, 0.22, 0.055);
-        self.set_hover(ID_PLAY_LEVEL, phit);
-        if phit && clicked {
-            audio.play_enter();
-            self.state = AppState::Playing {
-                level: self.selected,
-                difficulty_idx: self.difficulty_idx[self.selected as usize],
-            };
-        }
-    }
-
-    /// Settings screen. Tabbed layout; each tab is a short flat
-    /// list of rows. Hit testing and drawing are split between
-    /// `tick_settings` (here) and `draw_settings` (later).
-    fn tick_settings(
-        &mut self, nx: f32, ny: f32, clicked: bool,
-        audio: &Audio, config: &mut Config,
-    ) {
-        // Back / reset buttons.
-        let (bcx, bcy, bhw, bhh) = self.back_button_rect();
-        let back_hit = hit_rect(nx, ny, bcx, bcy, bhw, bhh);
-        self.set_hover(ID_BACK, back_hit);
+        // BACK button.
+        let back_rect = self.back_button_rect();
+        let back_hit = back_rect.contains(pointer.0, pointer.1);
+        let back_h = self.ui.track_hover(ID_BACK, back_hit);
+        self.draw_small_button(back_rect, "BACK", back_h);
         if back_hit && clicked {
             audio.play_interact();
-            config.clamp();
-            config.save();
             self.state = AppState::MainMenu;
             return;
         }
-        let (rcx, rcy, rhw, rhh) = self.reset_button_rect();
-        let reset_hit = hit_rect(nx, ny, rcx, rcy, rhw, rhh);
-        self.set_hover(ID_RESET, reset_hit);
-        if reset_hit && clicked {
-            audio.play_interact();
-            *config = Config::default();
+
+        // Title + nav hint.
+        let title_x = back_rect.x1 + 0.04;
+        let title_y = self.header_y() - font::text_height(TITLE_PX) * 0.5;
+        let sub_y = title_y + font::text_height(TITLE_PX) + 0.008;
+        {
+            let text = self.ui.text_mut();
+            font::push_text(text, "SELECT A LEVEL",
+                title_x, title_y, TITLE_PX, ACCENT_HI);
+            font::push_text(text, "UP / DOWN TO NAVIGATE - ENTER TO PLAY",
+                title_x, sub_y, SMALL_PX, DIM);
+        }
+
+        // Level rail (rows + separators + slanted edge).
+        if self.render_level_rail(pointer, clicked, audio) {
             return;
         }
 
-        // Tab bar.
-        let tabs = [
-            ("GRAPHICS",     ID_TAB_GFX),
-            ("AUDIO",        ID_TAB_AUD),
-            ("GAMEPLAY",     ID_TAB_GPL),
-            ("ACCESS",       ID_TAB_ACC),
-            ("CONTROLS",     ID_TAB_CTL),
-        ];
-        for (i, (_, id)) in tabs.iter().enumerate() {
-            let (cx, cy, hw, hh) = self.tab_rect(i, tabs.len());
-            let hit = hit_rect(nx, ny, cx, cy, hw, hh);
-            self.set_hover(*id, hit);
-            if hit && clicked && self.settings_tab != i {
-                self.settings_tab = i;
-                audio.play_interact();
-                return;
-            }
-        }
+        // Level card on the right of the slanted edge.
+        let lvl = crate::levels::get(self.selected);
+        let pal = lvl.palette;
+        let t = self.time;
+        let flash = self.beat_flash();
+        self.render_level_card(lvl, &pal, t, flash, pointer, clicked, audio);
 
-        // Delegate to the active tab.
-        match self.settings_tab {
-            0 => self.tick_tab_graphics     (nx, ny, clicked, audio, config),
-            1 => self.tick_tab_audio        (nx, ny, clicked, audio, config),
-            2 => self.tick_tab_gameplay     (nx, ny, clicked, audio, config),
-            3 => self.tick_tab_accessibility(nx, ny, clicked, audio, config),
-            _ => {} // controls tab is static text
-        }
-
-        config.clamp();
+        // Modifier strip pinned to the bottom.
+        self.render_modifier_row();
     }
 
-    fn tick_tab_graphics(
-        &mut self, nx: f32, ny: f32, clicked: bool,
-        audio: &Audio, config: &mut Config,
-    ) {
-        let rows = 11;
-        // Row 0: VSync cycle.
-        let (cx0, cy0) = self.row_center(0, rows);
-        if self.tick_cycle(nx, ny, clicked, audio,
-            cx0, cy0, ID_GFX_VSYNC_L, ID_GFX_VSYNC_R)
-        {
-            // Handled below in draw; we detect click direction here.
-        }
-        if self.arrow_clicked(nx, ny, clicked, cx0, cy0, false) {
-            config.vsync = vsync_prev(config.vsync);
-            audio.play_interact();
-        }
-        if self.arrow_clicked(nx, ny, clicked, cx0, cy0, true) {
-            config.vsync = config.vsync.next();
-            audio.play_interact();
-        }
-
-        // Row 1: FPS cap cycle.
-        let (_cx, cy1) = self.row_center(1, rows);
-        let cxf = cy1; // unused alias just to keep symmetry; actual x is fixed
-        let _ = cxf;
-        let (axc, ayc) = self.row_center(1, rows);
-        self.set_hover_arrows(nx, ny, axc, ayc, ID_GFX_FPS_L, ID_GFX_FPS_R);
-        if self.arrow_clicked(nx, ny, clicked, axc, ayc, false) {
-            config.fps_cap = fps_prev(config.fps_cap);
-            audio.play_interact();
-        }
-        if self.arrow_clicked(nx, ny, clicked, axc, ayc, true) {
-            config.fps_cap = fps_next(config.fps_cap);
-            audio.play_interact();
-        }
-
-        // Rows 2..=7: sliders.
-        self.tick_slider(nx, ny, clicked, 2, rows,
-            ID_GFX_BLOOM, &mut config.bloom_intensity, 0.0, 1.5, audio);
-        self.tick_slider(nx, ny, clicked, 3, rows,
-            ID_GFX_CHROMATIC, &mut config.chromatic_strength, 0.0, 1.0, audio);
-        self.tick_slider(nx, ny, clicked, 4, rows,
-            ID_GFX_SHAKE, &mut config.screen_shake, 0.0, 1.5, audio);
-        self.tick_slider(nx, ny, clicked, 5, rows,
-            ID_GFX_VIGNETTE, &mut config.vignette, 0.0, 1.0, audio);
-        self.tick_slider(nx, ny, clicked, 6, rows,
-            ID_GFX_BEAT_FLASH, &mut config.beat_flash, 0.0, 1.5, audio);
-        self.tick_slider(nx, ny, clicked, 7, rows,
-            ID_GFX_DEPTH, &mut config.fake_3d_depth, 0.0, 1.0, audio);
-
-        // Row 8: Particles cycle.
-        let (_, py8) = self.row_center(8, rows);
-        self.set_hover_arrows(nx, ny, 0.0, py8, ID_GFX_PART_L, ID_GFX_PART_R);
-        if self.arrow_clicked(nx, ny, clicked, 0.0, py8, false) {
-            config.particle_density = particle_prev(config.particle_density);
-            audio.play_interact();
-        }
-        if self.arrow_clicked(nx, ny, clicked, 0.0, py8, true) {
-            config.particle_density = config.particle_density.next();
-            audio.play_interact();
-        }
-
-        // Rows 9..=10: toggles.
-        self.tick_toggle(nx, ny, clicked, 9, rows, ID_GFX_SCANLINES,
-            &mut config.scanlines, audio);
-        self.tick_toggle(nx, ny, clicked, 10, rows, ID_GFX_SHOW_FPS,
-            &mut config.show_fps, audio);
-    }
-
-    fn tick_tab_audio(
-        &mut self, nx: f32, ny: f32, clicked: bool,
-        audio: &Audio, config: &mut Config,
-    ) {
-        let rows = 3;
-        self.tick_slider(nx, ny, clicked, 0, rows,
-            ID_AUD_MASTER, &mut config.master_volume, 0.0, 1.0, audio);
-        self.tick_slider(nx, ny, clicked, 1, rows,
-            ID_AUD_MUSIC,  &mut config.music_volume,  0.0, 1.0, audio);
-        self.tick_slider(nx, ny, clicked, 2, rows,
-            ID_AUD_SFX,    &mut config.sfx_volume,    0.0, 1.0, audio);
-    }
-
-    fn tick_tab_gameplay(
-        &mut self, nx: f32, ny: f32, clicked: bool,
-        audio: &Audio, config: &mut Config,
-    ) {
-        let rows = 5;
-        self.tick_slider(nx, ny, clicked, 0, rows,
-            ID_GPL_PSPEED, &mut config.player_speed, 0.5, 2.0, audio);
-        self.tick_slider(nx, ny, clicked, 1, rows,
-            ID_GPL_WOBBLE, &mut config.camera_wobble, 0.0, 1.0, audio);
-
-        let (_, py2) = self.row_center(2, rows);
-        self.set_hover_arrows(nx, ny, 0.0, py2, ID_GPL_ABILITY_L, ID_GPL_ABILITY_R);
-        if self.arrow_clicked(nx, ny, clicked, 0.0, py2, false) {
-            config.ability = ability_prev(config.ability);
-            audio.play_interact();
-        }
-        if self.arrow_clicked(nx, ny, clicked, 0.0, py2, true) {
-            config.ability = config.ability.next();
-            audio.play_interact();
-        }
-
-        self.tick_toggle(nx, ny, clicked, 3, rows, ID_GPL_CLOSE_FX,
-            &mut config.close_call_fx, audio);
-
-        let (_, py4) = self.row_center(4, rows);
-        self.set_hover_arrows(nx, ny, 0.0, py4, ID_GPL_HL_L, ID_GPL_HL_R);
-        if self.arrow_clicked(nx, ny, clicked, 0.0, py4, false) {
-            config.predictive_highlight = highlight_prev(config.predictive_highlight);
-            audio.play_interact();
-        }
-        if self.arrow_clicked(nx, ny, clicked, 0.0, py4, true) {
-            config.predictive_highlight = config.predictive_highlight.next();
-            audio.play_interact();
-        }
-    }
-
-    fn tick_tab_accessibility(
-        &mut self, nx: f32, ny: f32, clicked: bool,
-        audio: &Audio, config: &mut Config,
-    ) {
-        let rows = 4;
-        self.tick_toggle(nx, ny, clicked, 0, rows, ID_ACC_CONTRAST,
-            &mut config.high_contrast, audio);
-        self.tick_toggle(nx, ny, clicked, 1, rows, ID_ACC_REDUCE,
-            &mut config.reduce_motion, audio);
-        self.tick_toggle(nx, ny, clicked, 2, rows, ID_ACC_HITBOX,
-            &mut config.show_hitboxes, audio);
-
-        let (_, py3) = self.row_center(3, rows);
-        self.set_hover_arrows(nx, ny, 0.0, py3, ID_ACC_CB_L, ID_ACC_CB_R);
-        if self.arrow_clicked(nx, ny, clicked, 0.0, py3, false) {
-            config.colorblind = colorblind_prev(config.colorblind);
-            audio.play_interact();
-        }
-        if self.arrow_clicked(nx, ny, clicked, 0.0, py3, true) {
-            config.colorblind = config.colorblind.next();
-            audio.play_interact();
-        }
-    }
-
-    /// Unified slider tick for the settings screen. Returns true
-    /// when the value changed during this call.
-    fn tick_slider(
-        &mut self, nx: f32, ny: f32, clicked: bool,
-        row: usize, rows: usize, id: WidgetId,
-        value: &mut f32, min: f32, max: f32,
+    fn render_level_rail(
+        &mut self,
+        pointer: (f32, f32), clicked: bool,
         audio: &Audio,
     ) -> bool {
-        let (x0, x1) = self.slider_track_range();
-        let (_, y) = self.row_center(row, rows);
-
-        let t = ((*value - min) / (max - min)).clamp(0.0, 1.0);
-        let hx = x0 + (x1 - x0) * t;
-        let handle_hit = hit_rect(nx, ny, hx, y, 0.05, 0.04);
-        self.set_hover(id, handle_hit);
-        let track_hit = nx > x0 - 0.02 && nx < x1 + 0.02 && (ny - y).abs() < 0.04;
-        if clicked && (handle_hit || track_hit) {
-            audio.play_interact();
-            self.dragging = Some(id);
-            let nt = ((nx - x0) / (x1 - x0)).clamp(0.0, 1.0);
-            *value = min + (max - min) * nt;
-            return true;
-        }
-        false
-    }
-
-    /// Dragging a slider after it was grabbed.
-    fn handle_slider_drag(&mut self, id: WidgetId, nx: f32, config: &mut Config) {
-        // Map id to (value, min, max).
-        let (x0, x1) = self.slider_track_range();
-        let t = ((nx - x0) / (x1 - x0)).clamp(0.0, 1.0);
-        match id {
-            ID_GFX_BLOOM        => config.bloom_intensity    = 0.0 + (1.5 - 0.0) * t,
-            ID_GFX_CHROMATIC    => config.chromatic_strength = 0.0 + (1.0 - 0.0) * t,
-            ID_GFX_SHAKE        => config.screen_shake       = 0.0 + (1.5 - 0.0) * t,
-            ID_GFX_VIGNETTE     => config.vignette           = 0.0 + (1.0 - 0.0) * t,
-            ID_GFX_BEAT_FLASH   => config.beat_flash         = 0.0 + (1.5 - 0.0) * t,
-            ID_GFX_DEPTH        => config.fake_3d_depth      = 0.0 + (1.0 - 0.0) * t,
-            ID_AUD_MASTER       => config.master_volume      = t,
-            ID_AUD_MUSIC        => config.music_volume       = t,
-            ID_AUD_SFX          => config.sfx_volume         = t,
-            ID_GPL_PSPEED       => config.player_speed       = 0.5 + (2.0 - 0.5) * t,
-            ID_GPL_WOBBLE       => config.camera_wobble      = t,
-            _ => {}
-        }
-    }
-
-    /// Toggle widget: a small rectangular button showing ON / OFF.
-    fn tick_toggle(
-        &mut self, nx: f32, ny: f32, clicked: bool,
-        row: usize, rows: usize, id: WidgetId,
-        value: &mut bool, audio: &Audio,
-    ) -> bool {
-        let (cx, cy, hw, hh) = self.toggle_rect(row, rows);
-        let hit = hit_rect(nx, ny, cx, cy, hw, hh);
-        self.set_hover(id, hit);
-        if hit && clicked {
-            *value = !*value;
-            audio.play_interact();
-            return true;
-        }
-        false
-    }
-
-    /// Register hover targets for both arrows of a cycle widget at
-    /// row center `(cx, cy)`.
-    fn set_hover_arrows(
-        &mut self, nx: f32, ny: f32,
-        _cx: f32, cy: f32, id_l: WidgetId, id_r: WidgetId,
-    ) {
-        let (lx, rx) = self.arrow_positions();
-        self.set_hover(id_l, hit_rect(nx, ny, lx, cy, 0.05, 0.04));
-        self.set_hover(id_r, hit_rect(nx, ny, rx, cy, 0.05, 0.04));
-    }
-
-    /// Returns true if the arrow at the given row was clicked.
-    fn arrow_clicked(
-        &self, nx: f32, ny: f32, clicked: bool,
-        _cx: f32, cy: f32, right: bool,
-    ) -> bool {
-        if !clicked { return false; }
-        let (lx, rx) = self.arrow_positions();
-        let ax = if right { rx } else { lx };
-        hit_rect(nx, ny, ax, cy, 0.05, 0.04)
-    }
-
-    /// Legacy shim used by `tick_tab_graphics` for VSync row
-    /// (keeps a consistent signature for the Graphics row 0).
-    fn tick_cycle(
-        &mut self, nx: f32, ny: f32, _clicked: bool, _audio: &Audio,
-        _cx: f32, cy: f32, id_l: WidgetId, id_r: WidgetId,
-    ) -> bool {
-        self.set_hover_arrows(nx, ny, 0.0, cy, id_l, id_r);
-        false
-    }
-
-    fn tick_music_panel(
-        &mut self, nx: f32, ny: f32, clicked: bool,
-        audio: &Audio, snap: &AudioSnapshot,
-    ) -> bool {
-        let cy = self.view_top() + PANEL_EXTENDED_HEIGHT - 0.06;
-        let (bx0, bx1) = self.music_panel_bar_range();
-
-        let ctrl_x0 = bx0 - 0.26;
-        let pause_cx = ctrl_x0 + 0.050;
-        let stop_cx  = ctrl_x0 + 0.155;
-        let btn_hw   = 0.045;
-        let btn_hh   = 0.030;
-
-        let pause_hit = hit_rect(nx, ny, pause_cx, cy, btn_hw, btn_hh);
-        self.set_hover(ID_MUSIC_PAUSE, pause_hit);
-        if pause_hit && clicked {
-            audio.play_interact();
-            audio.set_music_paused(!snap.paused);
-            return true;
-        }
-
-        let stop_hit = hit_rect(nx, ny, stop_cx, cy, btn_hw, btn_hh);
-        self.set_hover(ID_MUSIC_STOP, stop_hit);
-        if stop_hit && clicked {
-            audio.play_interact();
-            audio.stop_music();
-            return true;
-        }
-
-        let bar_hit = nx > bx0 - 0.01
-                   && nx < bx1 + 0.01
-                   && (ny - cy).abs() < 0.022;
-        self.set_hover(ID_MUSIC_BAR, bar_hit);
-        if bar_hit && clicked && snap.duration > 0.0 {
-            let t = ((nx - bx0) / (bx1 - bx0)).clamp(0.0, 1.0);
-            audio.seek_music(t * snap.duration);
-            self.dragging = Some(ID_MUSIC_BAR);
-            return true;
-        }
-
-        clicked
-    }
-
-    // ---------- layout helpers ----------
-
-    fn back_button_rect(&self) -> (f32, f32, f32, f32) {
-        let cx = self.view_left() + 0.13;
-        let cy = HEADER_Y;
-        (cx, cy, 0.09, 0.040)
-    }
-
-    fn reset_button_rect(&self) -> (f32, f32, f32, f32) {
-        let cx = self.view_right() - 0.15;
-        let cy = HEADER_Y;
-        (cx, cy, 0.09, 0.040)
-    }
-
-    fn card_rect(&self) -> (f32, f32, f32, f32) {
-        let x1 = self.view_right() - 0.04;
-        let x0 = x1 - CARD_WIDTH;
-        let y0 = self.view_top() + PANEL_PEEK_HEIGHT + 0.03;
-        let y1 = MOD_SEPARATOR_Y - 0.02;
-        (x0, y0, x1, y1)
-    }
-
-    fn music_panel_bar_range(&self) -> (f32, f32) {
-        let right = self.view_right() - 0.55;
-        let left  = self.view_left() + 0.80;
-        (left, right)
-    }
-
-    fn tab_rect(&self, i: usize, n: usize) -> (f32, f32, f32, f32) {
-        let vl = self.view_left()  + 0.08;
-        let vr = self.view_right() - 0.08;
-        let total = vr - vl;
-        let gap = 0.010;
-        let cell = (total - gap * (n as f32 - 1.0)) / n as f32;
-        let x0 = vl + (cell + gap) * i as f32;
-        let x1 = x0 + cell;
-        let cx = (x0 + x1) * 0.5;
-        let hw = (x1 - x0) * 0.5;
-        (cx, SETTINGS_TAB_Y, hw, SETTINGS_TAB_H)
-    }
-
-    fn row_center(&self, row: usize, total: usize) -> (f32, f32) {
-        let total = total.max(1);
-        let top = SETTINGS_CONTENT_TOP;
-        let bot = SETTINGS_CONTENT_BOT;
-        let row_h = (bot - top) / total as f32;
-        let cy = top + row_h * (row as f32 + 0.5);
-        (0.0, cy)
-    }
-
-    fn slider_track_range(&self) -> (f32, f32) {
-        // Aligned so the track does not collide with the left
-        // label column. Values mirror the legacy slider range
-        // for familiarity.
-        let vl = self.view_left()  + 0.08;
-        let x0 = vl + 0.52;
-        let x1 = vl + 1.30;
-        (x0, x1)
-    }
-
-    fn arrow_positions(&self) -> (f32, f32) {
-        // Left and right arrow X for cycle widgets on the settings
-        // screen. The label sits to the left of `lx` and the name
-        // reads is centered between the two arrows.
-        let vl = self.view_left() + 0.08;
-        let lx = vl + 0.62;
-        let rx = vl + 1.22;
-        (lx, rx)
-    }
-
-    fn toggle_rect(&self, row: usize, rows: usize) -> (f32, f32, f32, f32) {
-        let (_, cy) = self.row_center(row, rows);
-        let vl = self.view_left() + 0.08;
-        let cx = vl + 0.92;
-        (cx, cy, 0.12, 0.032)
-    }
-
-    // ---------- rendering ----------
-
-    pub fn build_geometry(
-        &self, out: &mut Vec<Vertex>, snap: &AudioSnapshot, config: &Config,
-    ) {
-        out.clear();
-        self.draw_background(out);
-        match self.state {
-            AppState::Intro       => self.draw_intro(out),
-            AppState::MainMenu    => self.draw_main(out),
-            AppState::LevelSelect => self.draw_level_select(out),
-            AppState::Settings    => self.draw_settings(out, config),
-            _ => {}
-        }
-        self.draw_music_panel(out, snap);
-    }
-
-    fn draw_background(&self, out: &mut Vec<Vertex>) {
-        let flash = self.beat_flash();
-        let t = self.time;
-        let n = 12;
-        let span = TAU / n as f32;
-        let rot = t * 0.04;
-        let a = mix3(self.theme_bg_a, WHITE, 0.04 * flash);
-        let b = self.theme_bg_b;
-        for s in 0..n {
-            let a0 = s as f32 * span + rot;
-            let a1 = a0 + span;
-            let color = if s % 2 == 0 { a } else { b };
-            push_tri(out,
-                [0.0, 0.0],
-                [a0.cos() * BG_OUTER_R, a0.sin() * BG_OUTER_R],
-                [a1.cos() * BG_OUTER_R, a1.sin() * BG_OUTER_R],
-                color);
-        }
-        for i in 0..14 {
-            let f = i as f32 / 14.0;
-            let ang = f * TAU + t * 0.08;
-            let orbit = 1.25 + ((t * 0.20 + f * 6.3).sin() * 0.35);
-            let px = ang.cos() * orbit;
-            let py = ang.sin() * orbit;
-            let r = 0.011 + 0.004 * flash;
-            let c = mix3([0.18, 0.07, 0.16], self.theme_accent, 0.25);
-            push_hex(out, px, py, r, c);
-        }
-    }
-
-    fn draw_intro(&self, out: &mut Vec<Vertex>) {
-        let t = self.intro_time;
-        let d = INTRO_SECONDS;
-        let fade_in  = smoothstep(0.0, 0.8, t);
-        let fade_out = 1.0 - smoothstep(d - 0.6, d, t);
-        let alpha    = fade_in * fade_out;
-
-        let ring_t = smoothstep(0.0, 1.5, t);
-        let ring_r = ring_t * 0.9;
-        let count = 24;
-        for i in 0..count {
-            let ang = i as f32 / count as f32 * TAU;
-            let x = ang.cos() * ring_r;
-            let y = ang.sin() * ring_r;
-            let size = 0.015 * alpha;
-            let col = mix3(BG_DEEP, ACCENT, alpha);
-            push_hex(out, x, y, size, col);
-        }
-        let contract = 1.0 - 0.1 * smoothstep(d - 0.6, d, t);
-        let r0 = 0.22 * contract;
-        let r1 = 0.15 * contract;
-        let r2 = 0.07 * contract;
-        let tint = |c: [f32; 3]| mix3(BG_DEEP, c, alpha);
-        push_hex_rot(out, 0.0, -0.05, r0, tint(BG_PANEL),    t * 0.4);
-        push_hex_ring_rot(out, 0.0, -0.05, r0, r0 - 0.012, tint(ACCENT),    t * 0.4);
-        push_hex_rot(out, 0.0, -0.05, r1, tint(BG_PANEL_HI), -t * 0.9);
-        push_hex_ring_rot(out, 0.0, -0.05, r1, r1 - 0.010, tint(ACCENT_HI), -t * 0.9);
-        push_hex_rot(out, 0.0, -0.05, r2, tint(WHITE),       t * 1.6);
-
-        let slide = (1.0 - fade_in) * 0.08;
-        push_text_centered_alpha(out, "SUPER RUSTOGON", 0.0, 0.28 + slide, TITLE_PX, ACCENT_HI, alpha);
-        push_text_centered_alpha(out, "A HEXAGONAL DESCENT", 0.0, 0.42 + slide, H2_PX, WHITE, alpha * 0.7);
-        push_text_centered_alpha(out, "CLICK OR ENTER TO SKIP", 0.0, 0.85, SMALL_PX, DIM, (alpha * 0.8).max(0.0));
-    }
-
-    fn draw_main(&self, out: &mut Vec<Vertex>) {
-        let title_y = -0.80;
-        push_text_centered(out, "SUPER RUSTOGON",  0.006, title_y + 0.010, TITLE_PX, BG_DEEP);
-        push_text_centered(out, "SUPER RUSTOGON",  0.000, title_y,         TITLE_PX, ACCENT_HI);
-        push_text_centered(out, "A HEXAGONAL DESCENT", 0.0, title_y + 0.12, H2_PX, DIM);
-
-        let lw = 0.36;
-        push_quad(out, -0.52 - lw, title_y + 0.14, -0.52, title_y + 0.145, ACCENT);
-        push_quad(out,  0.52,      title_y + 0.14,  0.52 + lw, title_y + 0.145, ACCENT);
-
-        for (i, item) in MAIN_ITEMS.iter().enumerate() {
-            let (cx, cy) = main_item_pos(i);
-            let h = self.hover_eased(item.id);
-            self.draw_menu_bar(out, cx, cy, item.label, item.sub, h);
-        }
-
-        push_text(out, "V0.2", self.view_left() + 0.03, self.view_bottom() - 0.06, SMALL_PX, DIM);
-        push_text_centered(out, "MUSIC FROM OPENGAMEART", 0.0, self.view_bottom() - 0.06, SMALL_PX, DIM);
-        push_text_right(out, "ESC TO QUIT", self.view_right() - 0.03, self.view_bottom() - 0.06, SMALL_PX, DIM);
-    }
-
-    fn draw_menu_bar(
-        &self, out: &mut Vec<Vertex>,
-        cx: f32, cy: f32, label: &str, sub: &str, h: f32,
-    ) {
-        let slide = h * 0.025;
-        let bg   = mix3(BG_PANEL, BG_PANEL_HI, h);
-        let ring = mix3(ACCENT, ACCENT_HI, h);
-        let x0 = cx - BAR_HW + slide;
-        let x1 = cx + BAR_HW + slide;
-        let y0 = cy - BAR_HH;
-        let y1 = cy + BAR_HH;
-        push_quad(out, x0, y0, x1, y1, bg);
-        push_quad(out, x0, y0, x0 + 0.024, y1, ring);
-        if h > 0.01 {
-            push_outline(out, x0, y0, x1, y1, 0.004 + 0.002 * h, ring);
-            let chev_col = mix3(bg, ring, 0.5 + 0.5 * h);
-            push_tri(out,
-                [x1 - 0.075, cy - 0.035],
-                [x1 - 0.075, cy + 0.035],
-                [x1 - 0.030, cy],
-                chev_col);
-        }
-        let label_y = cy - text_height(BUTTON_PX) * 0.5 - 0.010;
-        push_text(out, label, x0 + 0.055, label_y, BUTTON_PX, WHITE);
-        let sub_y = label_y + text_height(BUTTON_PX) + 0.010;
-        push_text(out, sub, x0 + 0.055, sub_y, SMALL_PX, DIM);
-    }
-
-    fn draw_level_select(&self, out: &mut Vec<Vertex>) {
-        let lvl   = crate::levels::get(self.selected);
-        let pal   = &lvl.palette;
-        let t     = self.time;
-        let flash = self.beat_flash();
-
-        // Header row: BACK button then title + subtitle.
-        let (bcx, bcy, bhw, bhh) = self.back_button_rect();
-        self.draw_small_button(out, bcx, bcy, bhw, bhh, "BACK", ID_BACK);
-
-        let title_x = bcx + bhw + 0.04;
-        let title_y = HEADER_Y - text_height(TITLE_PX) * 0.5;
-        push_text(out, "SELECT A LEVEL", title_x, title_y, TITLE_PX, ACCENT_HI);
-        let sub_y = title_y + text_height(TITLE_PX) + 0.008;
-        push_text(out, "UP / DOWN TO NAVIGATE - ENTER TO PLAY",
-            title_x, sub_y, SMALL_PX, DIM);
-
-        self.draw_level_rail(out);
-        self.draw_level_card(out, lvl, pal, t, flash);
-        self.draw_modifier_row(out);
-    }
-
-    fn draw_level_rail(&self, out: &mut Vec<Vertex>) {
         let n = crate::levels::num();
+        let view_l = self.view_left();
+        let view_r = self.view_right();
+        let top_sep = self.top_separator_y();
+        let mod_sep = self.mod_separator_y();
+
+        // Rows. Drawn from earliest to latest so adjacent
+        // rows visually overlap correctly when the row stripe
+        // crosses the cell boundary.
+        let mut row_clicked: Option<u32> = None;
         for i in 0..n {
             let y = row_y(i, self.selected);
-            if y < RAIL_TOP - 0.25 || y > MOD_SEPARATOR_Y + 0.25 { continue; }
+            if y < top_sep - 0.25 || y > mod_sep + 0.25 { continue; }
             let id = id_level_row(i);
-            let hover = self.hover_eased(id);
-            self.draw_level_row(out, y, i, hover);
+            let rect = self.level_row_rect(i);
+            let hit = rect.contains(pointer.0, pointer.1);
+            let hover = self.ui.track_hover(id, hit);
+            self.draw_level_row(y, i, hover);
+            if hit && clicked {
+                row_clicked = Some(i as u32);
+            }
+        }
+        if let Some(idx) = row_clicked {
+            if self.selected == idx {
+                audio.play_enter();
+                self.state = AppState::Playing {
+                    level: idx,
+                    difficulty_idx: self.difficulty_idx[idx as usize],
+                };
+                return true;
+            }
+            self.selected = idx;
+            audio.play_interact();
+            self.ui.capture_pointer();
+            return true;
         }
 
-        push_quad(out,
-            self.view_left(), TOP_SEPARATOR_Y,
-            self.view_right(), TOP_SEPARATOR_Y + 0.004,
-            ACCENT);
+        // Separators.
+        {
+            let geom = self.ui.geom_mut();
+            push_quad(geom,
+                view_l, top_sep, view_r, top_sep + 0.004, ACCENT);
+            push_quad(geom,
+                view_l, mod_sep, view_r, mod_sep + 0.004, ACCENT);
+        }
 
-        push_quad(out,
-            self.view_left(), MOD_SEPARATOR_Y,
-            self.view_right(), MOD_SEPARATOR_Y + 0.004,
-            ACCENT);
-
-        push_slanted_edge(out,
+        // Slanted accent edge running between separators.
+        push_slanted_edge(self.ui.geom_mut(),
             RAIL_RIGHT_TOP, RAIL_RIGHT_BOTTOM,
-            TOP_SEPARATOR_Y, MOD_SEPARATOR_Y,
-            0.005, ACCENT);
+            top_sep, mod_sep, 0.005, ACCENT);
+
+        false
     }
 
     fn draw_level_row(
-        &self, out: &mut Vec<Vertex>, cy: f32, idx: usize, hover: f32,
+        &mut self, cy: f32, idx: usize, hover: f32,
     ) {
         let lvl = crate::levels::get(idx as u32);
-        let pal = &lvl.palette;
+        let pal = lvl.palette;
         let is_selected = idx as u32 == self.selected;
+        let top_sep = self.top_separator_y();
+        let mod_sep = self.mod_separator_y();
 
         let unclipped_top = cy - ROW_HH;
         let unclipped_bot = cy + ROW_HH;
-        if unclipped_bot <= TOP_SEPARATOR_Y + 0.004 { return; }
-        if unclipped_top >= MOD_SEPARATOR_Y { return; }
-        let y_top = unclipped_top.max(TOP_SEPARATOR_Y + 0.004);
-        let y_bot = unclipped_bot.min(MOD_SEPARATOR_Y);
+        if unclipped_bot <= top_sep + 0.004 { return; }
+        if unclipped_top >= mod_sep { return; }
+        let y_top = unclipped_top.max(top_sep + 0.004);
+        let y_bot = unclipped_bot.min(mod_sep);
 
-        let xr_top = rail_right_at(y_top);
-        let xr_bot = rail_right_at(y_bot);
+        let xr_top = self.rail_right_at(y_top);
+        let xr_bot = self.rail_right_at(y_bot);
 
         let view_l = self.view_left();
         let row_left_fill = view_l - RAIL_EXTEND_LEFT;
 
         if is_selected {
             let bg = mix3(BG_PANEL_HI, pal.bg_a, 0.50);
-            push_trapezoid(out, row_left_fill, row_left_fill,
+            push_trapezoid(self.ui.geom_mut(),
+                row_left_fill, row_left_fill,
                 xr_top, xr_bot, y_top, y_bot, bg);
-
             let delim = 0.004;
-            push_quad(out, row_left_fill, y_top,
+            let geom = self.ui.geom_mut();
+            push_quad(geom, row_left_fill, y_top,
                 xr_top, y_top + delim, pal.accent);
-            push_quad(out, row_left_fill, y_bot - delim,
+            push_quad(geom, row_left_fill, y_bot - delim,
                 xr_bot, y_bot, pal.accent);
         } else if hover > 0.01 {
             let bg = mix3(BG_PANEL, BG_PANEL_HI, hover);
-            push_trapezoid(out, row_left_fill, row_left_fill,
+            push_trapezoid(self.ui.geom_mut(),
+                row_left_fill, row_left_fill,
                 xr_top, xr_bot, y_top, y_bot, bg);
         }
 
@@ -1265,309 +1032,592 @@ impl Menu {
         let col_num_w    = 0.130;
         let col_gap      = 0.030;
 
-        let stripe_top = (cy - ROW_HH + 0.006).max(TOP_SEPARATOR_Y + 0.008);
-        let stripe_bot = (cy + ROW_HH - 0.006).min(MOD_SEPARATOR_Y - 0.002);
+        let stripe_top = (cy - ROW_HH + 0.006).max(top_sep + 0.008);
+        let stripe_bot = (cy + ROW_HH - 0.006).min(mod_sep - 0.002);
         if stripe_bot > stripe_top {
-            push_quad(out,
+            push_quad(self.ui.geom_mut(),
                 content_x, stripe_top,
                 content_x + col_stripe_w, stripe_bot,
                 pal.accent);
         }
 
-        if cy < TOP_SEPARATOR_Y + 0.006 { return; }
-        if cy > MOD_SEPARATOR_Y - 0.006 { return; }
+        if cy < top_sep + 0.006 { return; }
+        if cy > mod_sep - 0.006 { return; }
 
+        // Hex avatar.
         let hex_cx = content_x + col_stripe_w + col_icon_w * 0.5;
-        push_hex(out, hex_cx, cy, 0.035, pal.bg_a);
-        push_hex_ring(out, hex_cx, cy, 0.035, 0.028, pal.accent);
-        push_hex(out, hex_cx, cy, 0.014, pal.player);
+        {
+            let geom = self.ui.geom_mut();
+            push_hex(geom, hex_cx, cy, 0.035, pal.bg_a);
+            push_hex_ring(geom, hex_cx, cy, 0.035, 0.028, pal.accent);
+            push_hex(geom, hex_cx, cy, 0.014, pal.player);
+        }
 
+        // Number, name, subtitle.
         let num_col_left = content_x + col_stripe_w + col_icon_w;
         let num_col_right = num_col_left + col_num_w;
         let num = format!("{:02}", idx + 1);
         let num_color = if is_selected { pal.accent } else { DIM };
-        let num_y = cy - text_height(H1_PX) * 0.5 - 0.005;
-        push_text_right(out, &num, num_col_right, num_y, H1_PX, num_color);
+        let num_y = cy - font::text_height(H1_PX) * 0.5 - 0.005;
 
         let text_x = num_col_right + col_gap;
-        let name_h = text_height(H1_PX);
-        let sub_h  = text_height(SMALL_PX);
+        let name_h = font::text_height(H1_PX);
+        let sub_h  = font::text_height(SMALL_PX);
         let gap    = 0.005;
         let total_h = name_h + gap + sub_h;
         let name_y = cy - total_h * 0.5;
         let sub_y  = name_y + name_h + gap;
 
-        let slant_limit = rail_right_at(name_y) - 0.04;
+        let slant_limit = self.rail_right_at(name_y) - 0.04;
+
+        let text = self.ui.text_mut();
+        font::push_text_right(text, &num, num_col_right, num_y, H1_PX, num_color);
         if text_x < slant_limit {
-            push_text(out, &lvl.name,     text_x, name_y, H1_PX,    WHITE);
-            push_text(out, &lvl.subtitle, text_x, sub_y,  SMALL_PX, DIM);
+            font::push_text(text, &lvl.name,     text_x, name_y, H1_PX,    WHITE);
+            font::push_text(text, &lvl.subtitle, text_x, sub_y,  SMALL_PX, DIM);
         }
     }
 
-    fn draw_level_card(
-        &self, out: &mut Vec<Vertex>,
-        lvl: &crate::levels::Level, pal: &Palette,
+    fn render_level_card(
+        &mut self,
+        lvl: &crate::levels::Level,
+        pal: &Palette,
         t: f32, flash: f32,
+        pointer: (f32, f32), clicked: bool,
+        audio: &Audio,
     ) {
-        let (x0, y0, x1, y1) = self.card_rect();
+        let card = self.card_rect();
+        let (x0, y0, x1, y1) = (card.x0, card.y0, card.x1, card.y1);
 
-        push_quad(out, x0, y0, x1, y1, mix3(BG_DEEP, pal.bg_a, 0.45));
-        push_outline(out, x0, y0, x1, y1, 0.004, pal.accent);
+        // Card background + accent outline.
+        {
+            let geom = self.ui.geom_mut();
+            push_quad(geom, x0, y0, x1, y1, mix3(BG_DEEP, pal.bg_a, 0.45));
+            push_outline(geom, x0, y0, x1, y1, 0.004, pal.accent);
+        }
 
         let pad = 0.035;
-        let line_h_h1 = text_height(H1_PX) + 0.006;
-        let line_h_h2 = text_height(H2_PX) + 0.005;
-        let line_h_sm = text_height(SMALL_PX) + 0.004;
+        let line_h_h1 = font::text_height(H1_PX) + 0.006;
+        let line_h_h2 = font::text_height(H2_PX) + 0.005;
+        let line_h_sm = font::text_height(SMALL_PX) + 0.004;
 
+        // Rotating hex stack on the upper-left of the card.
         let hex_cx = x0 + 0.14;
         let hex_cy = y0 + 0.18;
         let r0 = 0.11;
         let r1 = 0.075;
         let r2 = 0.042;
-        push_hex_rot     (out, hex_cx, hex_cy, r0, pal.bg_a,           t * 0.20);
-        push_hex_ring_rot(out, hex_cx, hex_cy, r0, r0 - 0.012, pal.accent,       t * 0.20);
-        push_hex_rot     (out, hex_cx, hex_cy, r1, pal.bg_b,          -t * 0.45);
-        push_hex_ring_rot(out, hex_cx, hex_cy, r1, r1 - 0.010, pal.center_ring, -t * 0.45);
-        push_hex_rot(out, hex_cx, hex_cy, r2 + 0.006 * flash, pal.player, t * 0.85);
+        {
+            let geom = self.ui.geom_mut();
+            push_hex_rot     (geom, hex_cx, hex_cy, r0, pal.bg_a,           t * 0.20);
+            push_hex_ring_rot(geom, hex_cx, hex_cy, r0, r0 - 0.012, pal.accent,       t * 0.20);
+            push_hex_rot     (geom, hex_cx, hex_cy, r1, pal.bg_b,          -t * 0.45);
+            push_hex_ring_rot(geom, hex_cx, hex_cy, r1, r1 - 0.010, pal.center_ring, -t * 0.45);
+            push_hex_rot(geom, hex_cx, hex_cy, r2 + 0.006 * flash, pal.player, t * 0.85);
+        }
 
+        // Track / artist / tempo info on the upper right.
         let info_x = x0 + 0.30;
         let mut y = y0 + pad;
-        push_text(out, "TRACK", info_x, y, SMALL_PX, DIM);
-        y += line_h_sm;
-        push_text(out, &lvl.song, info_x, y, H1_PX, pal.accent);
-        y += line_h_h1 + 0.006;
-        push_text(out, "ARTIST", info_x, y, SMALL_PX, DIM);
-        y += line_h_sm;
-        push_text(out, &lvl.artist, info_x, y, H2_PX, WHITE);
-        y += line_h_h2 + 0.006;
-        let bpm = format!("{} BPM", lvl.music_bpm);
-        push_text(out, "TEMPO", info_x, y, SMALL_PX, DIM);
-        y += line_h_sm;
-        push_text(out, &bpm, info_x, y, H2_PX, pal.accent);
+        {
+            let text = self.ui.text_mut();
+            font::push_text(text, "TRACK", info_x, y, SMALL_PX, DIM);
+            y += line_h_sm;
+            font::push_text(text, &lvl.song, info_x, y, H1_PX, pal.accent);
+            y += line_h_h1 + 0.006;
+            font::push_text(text, "ARTIST", info_x, y, SMALL_PX, DIM);
+            y += line_h_sm;
+            font::push_text(text, &lvl.artist, info_x, y, H2_PX, WHITE);
+            y += line_h_h2 + 0.006;
+            let bpm = format!("{} BPM", lvl.music_bpm);
+            font::push_text(text, "TEMPO", info_x, y, SMALL_PX, DIM);
+            y += line_h_sm;
+            font::push_text(text, &bpm, info_x, y, H2_PX, pal.accent);
+        }
 
+        // Divider separating header from body.
         let divider_y = y0 + 0.45;
-        push_quad(out, x0 + pad, divider_y, x1 - pad, divider_y + 0.004,
+        push_quad(self.ui.geom_mut(),
+            x0 + pad, divider_y, x1 - pad, divider_y + 0.004,
             mix3(BG_DEEP, pal.accent, 0.3));
 
+        // Body: name, subtitle, description.
         let mut y = divider_y + 0.02;
-        push_text(out, &lvl.name, x0 + pad, y, H1_PX, WHITE);
-        y += line_h_h1;
-        push_text(out, &lvl.subtitle, x0 + pad, y, SMALL_PX, DIM);
-        y += line_h_sm + 0.006;
+        {
+            let text = self.ui.text_mut();
+            font::push_text(text, &lvl.name, x0 + pad, y, H1_PX, WHITE);
+            y += line_h_h1;
+            font::push_text(text, &lvl.subtitle, x0 + pad, y, SMALL_PX, DIM);
+            y += line_h_sm + 0.006;
+            font::push_text(text, "DESCRIPTION", x0 + pad, y, SMALL_PX, DIM);
+            y += line_h_sm;
+        }
 
-        push_text(out, "DESCRIPTION", x0 + pad, y, SMALL_PX, DIM);
-        y += line_h_sm;
-        push_text_wrapped(out, &lvl.description, x0 + pad, y,
-            (x1 - x0) - 2.0 * pad, BODY_PX, WHITE);
+        let max_w = (x1 - x0) - 2.0 * pad;
+        push_text_wrapped(self.ui.text_mut(),
+            &lvl.description, x0 + pad, y, max_w, BODY_PX, WHITE);
 
+        // Difficulty selector.
         let dcx = (x0 + x1) * 0.5;
-        let dy = 0.38;
+        let dy  = 0.38;
+
+        let larrow = Rect::from_center(dcx - 0.30, dy, 0.06, 0.05);
+        let rarrow = Rect::from_center(dcx + 0.30, dy, 0.06, 0.05);
+        let lhit = larrow.contains(pointer.0, pointer.1);
+        let rhit = rarrow.contains(pointer.0, pointer.1);
+        let lh = self.ui.track_hover(ID_DIFF_LEFT, lhit);
+        let rh = self.ui.track_hover(ID_DIFF_RIGHT, rhit);
+
+        if lhit && clicked {
+            audio.play_interact();
+            let di = &mut self.difficulty_idx[self.selected as usize];
+            if *di > 0 { *di -= 1; }
+            self.ui.capture_pointer();
+        }
+        if rhit && clicked {
+            audio.play_interact();
+            let len = lvl.difficulty_tiers.len();
+            let di = &mut self.difficulty_idx[self.selected as usize];
+            if (*di as usize) + 1 < len { *di += 1; }
+            self.ui.capture_pointer();
+        }
+
         let di = self.difficulty_idx[self.selected as usize] as usize;
-        let tier_label = lvl.difficulty_names.get(di)
-            .cloned()
+        let tier_label = lvl.difficulty_names.get(di).cloned()
             .unwrap_or_else(|| "NORMAL".to_string());
         let tier_mult  = lvl.difficulty_tiers.get(di)
             .map(|t| t.wall_speed_mult())
             .unwrap_or(1.0);
 
-        push_text_centered(out, "DIFFICULTY", dcx,
-            dy - 0.09 - text_height(SMALL_PX) * 0.5, SMALL_PX, DIM);
+        {
+            let text = self.ui.text_mut();
+            font::push_text_centered(text, "DIFFICULTY", dcx,
+                dy - 0.09 - font::text_height(SMALL_PX) * 0.5,
+                SMALL_PX, DIM);
+        }
 
-        let lh = self.hover_eased(ID_DIFF_LEFT);
-        let rh = self.hover_eased(ID_DIFF_RIGHT);
         let dimc: [f32; 3] = [0.25, 0.15, 0.25];
         let lc = if di > 0 { mix3(pal.accent, ACCENT_HI, lh) } else { dimc };
         let rc = if di + 1 < lvl.difficulty_tiers.len() {
             mix3(pal.accent, ACCENT_HI, rh) } else { dimc };
         let lx = dcx - 0.30;
         let rx = dcx + 0.30;
-        push_tri(out, [lx - 0.04 - lh * 0.006, dy],
-                      [lx + 0.028, dy - 0.040],
-                      [lx + 0.028, dy + 0.040], lc);
-        push_tri(out, [rx + 0.04 + rh * 0.006, dy],
-                      [rx - 0.028, dy - 0.040],
-                      [rx - 0.028, dy + 0.040], rc);
+        {
+            let geom = self.ui.geom_mut();
+            push_tri(geom,
+                [lx - 0.04 - lh * 0.006, dy],
+                [lx + 0.028, dy - 0.040],
+                [lx + 0.028, dy + 0.040], lc);
+            push_tri(geom,
+                [rx + 0.04 + rh * 0.006, dy],
+                [rx - 0.028, dy - 0.040],
+                [rx - 0.028, dy + 0.040], rc);
+        }
 
-        push_text_centered(out, &tier_label, dcx,
-            dy - text_height(H1_PX) * 0.5, H1_PX, WHITE);
-        let mstr = format!("X{:.2}", tier_mult);
-        push_text_centered(out, &mstr, dcx,
-            dy + text_height(H1_PX) * 0.5 + 0.006, SMALL_PX, pal.accent);
+        {
+            let text = self.ui.text_mut();
+            font::push_text_centered(text, &tier_label, dcx,
+                dy - font::text_height(H1_PX) * 0.5, H1_PX, WHITE);
+            let mstr = format!("X{:.2}", tier_mult);
+            font::push_text_centered(text, &mstr, dcx,
+                dy + font::text_height(H1_PX) * 0.5 + 0.006, SMALL_PX, pal.accent);
+        }
 
-        let n = lvl.difficulty_tiers.len();
-        for i in 0..n {
-            let dx = dcx - 0.10 + (i as f32 / (n - 1).max(1) as f32) * 0.20;
+        // Tier dots.
+        let n_tiers = lvl.difficulty_tiers.len();
+        for i in 0..n_tiers {
+            let dx = dcx - 0.10 + (i as f32 / (n_tiers - 1).max(1) as f32) * 0.20;
             let lit = i <= di;
             let color = if lit { pal.accent } else { DIM };
             let r = if lit { 0.012 } else { 0.009 };
-            push_hex(out, dx, dy + 0.10, r, color);
+            push_hex(self.ui.geom_mut(), dx, dy + 0.10, r, color);
         }
 
-        self.draw_play_button(out, dcx, y1 - 0.08, pal);
+        // PLAY button at the bottom of the card.
+        let play_rect = Rect::from_center(dcx, y1 - 0.08, 0.22, 0.055);
+        let phit = play_rect.contains(pointer.0, pointer.1);
+        let ph = self.ui.track_hover(ID_PLAY_LEVEL, phit);
+        self.draw_play_button(play_rect.center(), pal, ph);
+        if phit && clicked {
+            audio.play_enter();
+            self.state = AppState::Playing {
+                level: self.selected,
+                difficulty_idx: self.difficulty_idx[self.selected as usize],
+            };
+        }
     }
 
     fn draw_play_button(
-        &self, out: &mut Vec<Vertex>,
-        pcx: f32, pcy: f32, pal: &Palette,
+        &mut self,
+        center: (f32, f32),
+        pal: &Palette, ph: f32,
     ) {
-        let ph = self.hover_eased(ID_PLAY_LEVEL);
-        let bg  = mix3(BG_PANEL, BG_PANEL_HI, ph);
+        let (pcx, pcy) = center;
+        let bg   = mix3(BG_PANEL, BG_PANEL_HI, ph);
         let ring = mix3(pal.accent, ACCENT_HI, ph);
         let hw = 0.22 + 0.006 * ph;
         let hh = 0.055 + 0.003 * ph;
         let thick = 0.005 + 0.002 * ph;
 
-        push_quad(out, pcx - hw, pcy - hh, pcx + hw, pcy + hh, bg);
-        push_outline(out, pcx - hw, pcy - hh, pcx + hw, pcy + hh, thick, ring);
+        {
+            let geom = self.ui.geom_mut();
+            push_quad(geom, pcx - hw, pcy - hh, pcx + hw, pcy + hh, bg);
+            push_outline(geom, pcx - hw, pcy - hh, pcx + hw, pcy + hh, thick, ring);
+        }
 
         let chev_w = 0.040;
         let chev_h = 0.028;
         let gap    = 0.018;
-        let text_w = text_width("PLAY", BUTTON_PX);
+        let text_w = font::text_width("PLAY", BUTTON_PX);
         let content_w = chev_w + gap + text_w;
         let content_left = pcx - content_w * 0.5;
         let chev_x = content_left;
         let text_x = chev_x + chev_w + gap;
 
-        push_tri(out,
+        push_tri(self.ui.geom_mut(),
             [chev_x,          pcy - chev_h],
             [chev_x,          pcy + chev_h],
             [chev_x + chev_w, pcy],
             ring);
-        push_text(out, "PLAY", text_x,
-            pcy - text_height(BUTTON_PX) * 0.5, BUTTON_PX, ring);
+
+        font::push_text(self.ui.text_mut(), "PLAY", text_x,
+            pcy - font::text_height(BUTTON_PX) * 0.5, BUTTON_PX, ring);
     }
 
-    fn draw_modifier_row(&self, out: &mut Vec<Vertex>) {
-        let y0 = MOD_ROW_TOP;
-        let y1 = MOD_ROW_BOT;
-        let left  = self.view_left() + 0.04;
-        let right = self.view_right() - 0.04;
-        let count = 5;
-        let total_w = right - left;
-        let cell_w = total_w / count as f32 - 0.015;
-
-        for i in 0..count {
-            let x0 = left + i as f32 * (cell_w + 0.015);
-            let x1 = x0 + cell_w;
-            push_quad(out, x0, y0, x1, y1, BG_PANEL);
-            push_outline(out, x0, y0, x1, y1, 0.003, DIM);
+    fn render_modifier_row(&mut self) {
+        let strip = self.modifier_strip_rect();
+        let cells = strip.split_x(5, 0.015);
+        for (i, cell) in cells.iter().enumerate() {
+            {
+                let geom = self.ui.geom_mut();
+                push_quad(geom, cell.x0, cell.y0, cell.x1, cell.y1, BG_PANEL);
+                push_outline(geom, cell.x0, cell.y0, cell.x1, cell.y1, 0.003, DIM);
+            }
             let label = if i == 0 { "RANDOM LVL" } else { "MODIFIER" };
             let sub   = if i == 0 { "SHUFFLE" }    else { "PLACEHOLDER" };
-            push_text(out, label, x0 + 0.012, y0 + 0.020, SMALL_PX, WHITE);
-            push_text(out, sub,   x0 + 0.012, y0 + 0.020 + text_height(SMALL_PX) + 0.005,
+            let text = self.ui.text_mut();
+            font::push_text(text, label,
+                cell.x0 + 0.012, cell.y0 + 0.020, SMALL_PX, WHITE);
+            font::push_text(text, sub,
+                cell.x0 + 0.012,
+                cell.y0 + 0.020 + font::text_height(SMALL_PX) + 0.005,
                 SMALL_PX, DIM);
         }
     }
 
-    // ---------- settings drawing ----------
+    // ---------- settings ----------
 
-    fn draw_settings(&self, out: &mut Vec<Vertex>, config: &Config) {
-        push_text_centered(out, "OPTIONS",        0.0, -0.92, TITLE_PX, ACCENT_HI);
-        push_text_centered(out, "TUNE THE FEEL",  0.0, -0.84, H2_PX,    DIM);
+    fn render_settings(
+        &mut self, audio: &Audio, config: &mut Config,
+        consume_input: bool,
+    ) {
+        let pointer = self.ui.input().pointer;
+        let clicked = self.ui.input().left_clicked && consume_input;
 
-        let (bcx, bcy, bhw, bhh) = self.back_button_rect();
-        self.draw_small_button(out, bcx, bcy, bhw, bhh, "BACK", ID_BACK);
-        let (rcx, rcy, rhw, rhh) = self.reset_button_rect();
-        self.draw_small_button(out, rcx, rcy, rhw, rhh, "RESET", ID_RESET);
+        // Title + subtitle.
+        let title_y = self.view_top() + SETTINGS_TITLE_INSET;
+        let sub_y   = self.view_top() + SETTINGS_SUBTITLE_INSET;
+        {
+            let text = self.ui.text_mut();
+            font::push_text_centered(text, "OPTIONS",
+                0.0, title_y, TITLE_PX, ACCENT_HI);
+            font::push_text_centered(text, "TUNE THE FEEL",
+                0.0, sub_y, H2_PX, DIM);
+        }
+
+        // BACK + RESET buttons.
+        let back_rect = self.back_button_rect();
+        let back_hit = back_rect.contains(pointer.0, pointer.1);
+        let back_h = self.ui.track_hover(ID_BACK, back_hit);
+        self.draw_small_button(back_rect, "BACK", back_h);
+        if back_hit && clicked {
+            audio.play_interact();
+            config.clamp();
+            config.save();
+            self.state = AppState::MainMenu;
+            return;
+        }
+        let reset_rect = self.reset_button_rect();
+        let reset_hit = reset_rect.contains(pointer.0, pointer.1);
+        let reset_h = self.ui.track_hover(ID_RESET, reset_hit);
+        self.draw_small_button(reset_rect, "RESET", reset_h);
+        if reset_hit && clicked {
+            audio.play_interact();
+            *config = Config::default();
+            return;
+        }
 
         // Tab bar.
-        let tabs = [
+        let tabs: [(&str, WidgetId); 5] = [
             ("GRAPHICS", ID_TAB_GFX),
             ("AUDIO",    ID_TAB_AUD),
             ("GAMEPLAY", ID_TAB_GPL),
             ("ACCESS",   ID_TAB_ACC),
             ("CONTROLS", ID_TAB_CTL),
         ];
+        let mut next_tab: Option<usize> = None;
         for (i, (label, id)) in tabs.iter().enumerate() {
-            let (cx, cy, hw, hh) = self.tab_rect(i, tabs.len());
+            let rect = self.tab_rect(i, tabs.len());
+            let hit = rect.contains(pointer.0, pointer.1);
+            let h = self.ui.track_hover(*id, hit);
             let active = i == self.settings_tab;
-            let h = self.hover_eased(*id);
-            let x0 = cx - hw; let x1 = cx + hw;
-            let y0 = cy - hh; let y1 = cy + hh;
             let bg = if active {
                 BG_PANEL_HI
             } else {
                 mix3(BG_PANEL, BG_PANEL_HI, h)
             };
-            push_quad(out, x0, y0, x1, y1, bg);
+            push_quad(self.ui.geom_mut(),
+                rect.x0, rect.y0, rect.x1, rect.y1, bg);
             if active {
-                push_quad(out, x0, y1 - 0.006, x1, y1, ACCENT);
+                push_quad(self.ui.geom_mut(),
+                    rect.x0, rect.y1 - 0.006, rect.x1, rect.y1, ACCENT);
             } else {
-                push_outline(out, x0, y0, x1, y1, 0.002,
+                push_outline(self.ui.geom_mut(),
+                    rect.x0, rect.y0, rect.x1, rect.y1, 0.002,
                     mix3(DIM, ACCENT, h));
             }
-            let w = text_width(label, BUTTON_PX);
-            push_text(out, label, cx - w * 0.5,
-                cy - text_height(BUTTON_PX) * 0.5, BUTTON_PX,
-                if active { WHITE } else { DIM });
+            let (cx, cy) = rect.center();
+            let w = font::text_width(label, BUTTON_PX);
+            let label_color = if active { WHITE } else { DIM };
+            font::push_text(self.ui.text_mut(), label,
+                cx - w * 0.5,
+                cy - font::text_height(BUTTON_PX) * 0.5,
+                BUTTON_PX, label_color);
+            if hit && clicked && !active {
+                next_tab = Some(i);
+            }
+        }
+        if let Some(i) = next_tab {
+            self.settings_tab = i;
+            audio.play_interact();
+            return;
         }
 
-        // Content per tab.
+        // Active tab content.
         match self.settings_tab {
-            0 => self.draw_tab_graphics(out, config),
-            1 => self.draw_tab_audio   (out, config),
-            2 => self.draw_tab_gameplay(out, config),
-            3 => self.draw_tab_access  (out, config),
-            _ => self.draw_tab_controls(out),
+            0 => self.render_tab_graphics(pointer, clicked, audio, config),
+            1 => self.render_tab_audio   (pointer, clicked, audio, config),
+            2 => self.render_tab_gameplay(pointer, clicked, audio, config),
+            3 => self.render_tab_access  (pointer, clicked, audio, config),
+            _ => self.render_tab_controls(),
+        }
+
+        config.clamp();
+    }
+
+    fn render_tab_graphics(
+        &mut self, pointer: (f32, f32), clicked: bool,
+        audio: &Audio, config: &mut Config,
+    ) {
+        let rows = 12;
+
+        // Row 0: V-Sync cycle.
+        {
+            let (_, cy) = self.row_center(0, rows);
+            self.set_hover_arrows(pointer, cy, ID_GFX_VSYNC_L, ID_GFX_VSYNC_R);
+            if self.arrow_clicked(pointer, clicked, cy, false) {
+                config.vsync = vsync_prev(config.vsync);
+                audio.play_interact();
+            }
+            if self.arrow_clicked(pointer, clicked, cy, true) {
+                config.vsync = config.vsync.next();
+                audio.play_interact();
+            }
+            self.draw_cycle_row(0, rows, "V-SYNC", config.vsync.label());
+        }
+
+        // Row 1: FPS cap cycle.
+        {
+            let (_, cy) = self.row_center(1, rows);
+            self.set_hover_arrows(pointer, cy, ID_GFX_FPS_L, ID_GFX_FPS_R);
+            if self.arrow_clicked(pointer, clicked, cy, false) {
+                config.fps_cap = fps_prev(config.fps_cap);
+                audio.play_interact();
+            }
+            if self.arrow_clicked(pointer, clicked, cy, true) {
+                config.fps_cap = fps_next(config.fps_cap);
+                audio.play_interact();
+            }
+            let fps_label = fps_label(config.fps_cap);
+            self.draw_cycle_row(1, rows, "FPS CAP", &fps_label);
+        }
+
+        // Rows 2..7: sliders.
+        self.tick_slider(pointer, clicked, 2, rows,
+            ID_GFX_BLOOM, &mut config.bloom_intensity, 0.0, 1.5, audio);
+        self.tick_slider(pointer, clicked, 3, rows,
+            ID_GFX_CHROMATIC, &mut config.chromatic_strength, 0.0, 1.0, audio);
+        self.tick_slider(pointer, clicked, 4, rows,
+            ID_GFX_SHAKE, &mut config.screen_shake, 0.0, 1.5, audio);
+        self.tick_slider(pointer, clicked, 5, rows,
+            ID_GFX_VIGNETTE, &mut config.vignette, 0.0, 1.0, audio);
+        self.tick_slider(pointer, clicked, 6, rows,
+            ID_GFX_BEAT_FLASH, &mut config.beat_flash, 0.0, 1.5, audio);
+        self.tick_slider(pointer, clicked, 7, rows,
+            ID_GFX_DEPTH, &mut config.fake_3d_depth, 0.0, 1.0, audio);
+
+        self.draw_slider_row(2, rows, "BLOOM",          config.bloom_intensity,    0.0, 1.5, ID_GFX_BLOOM);
+        self.draw_slider_row(3, rows, "CHROMATIC",      config.chromatic_strength, 0.0, 1.0, ID_GFX_CHROMATIC);
+        self.draw_slider_row(4, rows, "SCREEN SHAKE",   config.screen_shake,       0.0, 1.5, ID_GFX_SHAKE);
+        self.draw_slider_row(5, rows, "VIGNETTE",       config.vignette,           0.0, 1.0, ID_GFX_VIGNETTE);
+        self.draw_slider_row(6, rows, "BEAT FLASH",     config.beat_flash,         0.0, 1.5, ID_GFX_BEAT_FLASH);
+        self.draw_slider_row(7, rows, "FAKE 3D DEPTH",  config.fake_3d_depth,      0.0, 1.0, ID_GFX_DEPTH);
+
+        // Row 8: Particles cycle.
+        {
+            let (_, cy) = self.row_center(8, rows);
+            self.set_hover_arrows(pointer, cy, ID_GFX_PART_L, ID_GFX_PART_R);
+            if self.arrow_clicked(pointer, clicked, cy, false) {
+                config.particle_density = particle_prev(config.particle_density);
+                audio.play_interact();
+            }
+            if self.arrow_clicked(pointer, clicked, cy, true) {
+                config.particle_density = config.particle_density.next();
+                audio.play_interact();
+            }
+            self.draw_cycle_row(8, rows, "PARTICLES",
+                config.particle_density.label());
+        }
+
+        // Rows 9..10: toggles.
+        self.tick_toggle(pointer, clicked, 9, rows, ID_GFX_SCANLINES,
+            &mut config.scanlines, audio);
+        self.tick_toggle(pointer, clicked, 10, rows, ID_GFX_SHOW_FPS,
+            &mut config.show_fps, audio);
+        self.draw_toggle_row(9,  rows, "SCANLINES", config.scanlines, ID_GFX_SCANLINES);
+        self.draw_toggle_row(10, rows, "SHOW FPS",  config.show_fps,  ID_GFX_SHOW_FPS);
+
+        // Row 11: custom shaders cycle.
+        {
+            let (_, cy) = self.row_center(11, rows);
+            self.set_hover_arrows(pointer, cy, ID_GFX_SHADERS_L, ID_GFX_SHADERS_R);
+            if self.arrow_clicked(pointer, clicked, cy, false) {
+                config.custom_shaders = custom_shaders_prev(config.custom_shaders);
+                audio.play_interact();
+            }
+            if self.arrow_clicked(pointer, clicked, cy, true) {
+                config.custom_shaders = config.custom_shaders.next();
+                audio.play_interact();
+            }
+            self.draw_cycle_row(11, rows, "SHADERS",
+                config.custom_shaders.label());
+            let hint = match config.custom_shaders {
+                CustomShaders::Off =>
+                    "USER SHADERS DISABLED. SAFE DEFAULT.",
+                CustomShaders::Audit =>
+                    "COMPILE AND VALIDATE. NO RENDERING.",
+                CustomShaders::On =>
+                    "RENDER USER SHADERS. CAN STRESS THE GPU.",
+            };
+            let view_l = self.view_left();
+            font::push_text(self.ui.text_mut(), hint,
+                view_l + 0.52, cy + 0.035, SMALL_PX, DIM);
         }
     }
 
-    fn draw_tab_graphics(&self, out: &mut Vec<Vertex>, c: &Config) {
-        let rows = 11;
-        self.draw_cycle_row(out, 0, rows, "V-SYNC",
-            c.vsync.label(), ID_GFX_VSYNC_L, ID_GFX_VSYNC_R);
-        let fps_label = fps_label(c.fps_cap);
-        self.draw_cycle_row(out, 1, rows, "FPS CAP",
-            &fps_label, ID_GFX_FPS_L, ID_GFX_FPS_R);
-
-        self.draw_slider_row(out, 2,  rows, "BLOOM",          c.bloom_intensity,    0.0, 1.5, ID_GFX_BLOOM);
-        self.draw_slider_row(out, 3,  rows, "CHROMATIC",      c.chromatic_strength, 0.0, 1.0, ID_GFX_CHROMATIC);
-        self.draw_slider_row(out, 4,  rows, "SCREEN SHAKE",   c.screen_shake,       0.0, 1.5, ID_GFX_SHAKE);
-        self.draw_slider_row(out, 5,  rows, "VIGNETTE",       c.vignette,           0.0, 1.0, ID_GFX_VIGNETTE);
-        self.draw_slider_row(out, 6,  rows, "BEAT FLASH",     c.beat_flash,         0.0, 1.5, ID_GFX_BEAT_FLASH);
-        self.draw_slider_row(out, 7,  rows, "FAKE 3D DEPTH",  c.fake_3d_depth,      0.0, 1.0, ID_GFX_DEPTH);
-
-        self.draw_cycle_row(out, 8, rows, "PARTICLES",
-            c.particle_density.label(), ID_GFX_PART_L, ID_GFX_PART_R);
-        self.draw_toggle_row(out, 9,  rows, "SCANLINES", c.scanlines,  ID_GFX_SCANLINES);
-        self.draw_toggle_row(out, 10, rows, "SHOW FPS",  c.show_fps,   ID_GFX_SHOW_FPS);
-    }
-
-    fn draw_tab_audio(&self, out: &mut Vec<Vertex>, c: &Config) {
+    fn render_tab_audio(
+        &mut self, pointer: (f32, f32), clicked: bool,
+        audio: &Audio, config: &mut Config,
+    ) {
         let rows = 3;
-        self.draw_slider_row(out, 0, rows, "MASTER VOLUME", c.master_volume, 0.0, 1.0, ID_AUD_MASTER);
-        self.draw_slider_row(out, 1, rows, "MUSIC VOLUME",  c.music_volume,  0.0, 1.0, ID_AUD_MUSIC);
-        self.draw_slider_row(out, 2, rows, "SFX VOLUME",    c.sfx_volume,    0.0, 1.0, ID_AUD_SFX);
+        self.tick_slider(pointer, clicked, 0, rows,
+            ID_AUD_MASTER, &mut config.master_volume, 0.0, 1.0, audio);
+        self.tick_slider(pointer, clicked, 1, rows,
+            ID_AUD_MUSIC,  &mut config.music_volume,  0.0, 1.0, audio);
+        self.tick_slider(pointer, clicked, 2, rows,
+            ID_AUD_SFX,    &mut config.sfx_volume,    0.0, 1.0, audio);
+        self.draw_slider_row(0, rows, "MASTER VOLUME", config.master_volume, 0.0, 1.0, ID_AUD_MASTER);
+        self.draw_slider_row(1, rows, "MUSIC VOLUME",  config.music_volume,  0.0, 1.0, ID_AUD_MUSIC);
+        self.draw_slider_row(2, rows, "SFX VOLUME",    config.sfx_volume,    0.0, 1.0, ID_AUD_SFX);
     }
 
-    fn draw_tab_gameplay(&self, out: &mut Vec<Vertex>, c: &Config) {
+    fn render_tab_gameplay(
+        &mut self, pointer: (f32, f32), clicked: bool,
+        audio: &Audio, config: &mut Config,
+    ) {
         let rows = 5;
-        self.draw_slider_row(out, 0, rows, "PLAYER SPEED",   c.player_speed,  0.5, 2.0, ID_GPL_PSPEED);
-        self.draw_slider_row(out, 1, rows, "CAMERA WOBBLE",  c.camera_wobble, 0.0, 1.0, ID_GPL_WOBBLE);
-        self.draw_cycle_row (out, 2, rows, "ABILITY",
-            c.ability.label(), ID_GPL_ABILITY_L, ID_GPL_ABILITY_R);
-        self.draw_toggle_row(out, 3, rows, "CLOSE-CALL FX", c.close_call_fx, ID_GPL_CLOSE_FX);
-        self.draw_cycle_row (out, 4, rows, "PREDICT HIGHLIGHT",
-            c.predictive_highlight.label(), ID_GPL_HL_L, ID_GPL_HL_R);
+        self.tick_slider(pointer, clicked, 0, rows,
+            ID_GPL_PSPEED, &mut config.player_speed, 0.5, 2.0, audio);
+        self.tick_slider(pointer, clicked, 1, rows,
+            ID_GPL_WOBBLE, &mut config.camera_wobble, 0.0, 1.0, audio);
 
-        // Ability description under the widgets.
+        {
+            let (_, cy) = self.row_center(2, rows);
+            self.set_hover_arrows(pointer, cy, ID_GPL_ABILITY_L, ID_GPL_ABILITY_R);
+            if self.arrow_clicked(pointer, clicked, cy, false) {
+                config.ability = ability_prev(config.ability);
+                audio.play_interact();
+            }
+            if self.arrow_clicked(pointer, clicked, cy, true) {
+                config.ability = config.ability.next();
+                audio.play_interact();
+            }
+        }
+
+        self.tick_toggle(pointer, clicked, 3, rows, ID_GPL_CLOSE_FX,
+            &mut config.close_call_fx, audio);
+
+        {
+            let (_, cy) = self.row_center(4, rows);
+            self.set_hover_arrows(pointer, cy, ID_GPL_HL_L, ID_GPL_HL_R);
+            if self.arrow_clicked(pointer, clicked, cy, false) {
+                config.predictive_highlight =
+                    highlight_prev(config.predictive_highlight);
+                audio.play_interact();
+            }
+            if self.arrow_clicked(pointer, clicked, cy, true) {
+                config.predictive_highlight =
+                    config.predictive_highlight.next();
+                audio.play_interact();
+            }
+        }
+
+        self.draw_slider_row(0, rows, "PLAYER SPEED",   config.player_speed,  0.5, 2.0, ID_GPL_PSPEED);
+        self.draw_slider_row(1, rows, "CAMERA WOBBLE",  config.camera_wobble, 0.0, 1.0, ID_GPL_WOBBLE);
+        self.draw_cycle_row (2, rows, "ABILITY", config.ability.label());
+        self.draw_toggle_row(3, rows, "CLOSE-CALL FX", config.close_call_fx, ID_GPL_CLOSE_FX);
+        self.draw_cycle_row (4, rows, "PREDICT HIGHLIGHT",
+            config.predictive_highlight.label());
+
+        // Ability description under row 2.
         let (_, cy) = self.row_center(2, rows);
-        let vl = self.view_left() + 0.08;
-        push_text(out, c.ability.description(),
-            vl + 0.52, cy + 0.035, SMALL_PX, DIM);
+        let view_l = self.view_left();
+        font::push_text(self.ui.text_mut(), config.ability.description(),
+            view_l + 0.52, cy + 0.035, SMALL_PX, DIM);
     }
 
-    fn draw_tab_access(&self, out: &mut Vec<Vertex>, c: &Config) {
+    fn render_tab_access(
+        &mut self, pointer: (f32, f32), clicked: bool,
+        audio: &Audio, config: &mut Config,
+    ) {
         let rows = 4;
-        self.draw_toggle_row(out, 0, rows, "HIGH CONTRAST",  c.high_contrast,  ID_ACC_CONTRAST);
-        self.draw_toggle_row(out, 1, rows, "REDUCE MOTION",  c.reduce_motion,  ID_ACC_REDUCE);
-        self.draw_toggle_row(out, 2, rows, "SHOW HITBOXES",  c.show_hitboxes,  ID_ACC_HITBOX);
-        self.draw_cycle_row (out, 3, rows, "COLOR BLIND MODE",
-            c.colorblind.label(), ID_ACC_CB_L, ID_ACC_CB_R);
+        self.tick_toggle(pointer, clicked, 0, rows, ID_ACC_CONTRAST,
+            &mut config.high_contrast, audio);
+        self.tick_toggle(pointer, clicked, 1, rows, ID_ACC_REDUCE,
+            &mut config.reduce_motion, audio);
+        self.tick_toggle(pointer, clicked, 2, rows, ID_ACC_HITBOX,
+            &mut config.show_hitboxes, audio);
+
+        {
+            let (_, cy) = self.row_center(3, rows);
+            self.set_hover_arrows(pointer, cy, ID_ACC_CB_L, ID_ACC_CB_R);
+            if self.arrow_clicked(pointer, clicked, cy, false) {
+                config.colorblind = colorblind_prev(config.colorblind);
+                audio.play_interact();
+            }
+            if self.arrow_clicked(pointer, clicked, cy, true) {
+                config.colorblind = config.colorblind.next();
+                audio.play_interact();
+            }
+        }
+
+        self.draw_toggle_row(0, rows, "HIGH CONTRAST", config.high_contrast,  ID_ACC_CONTRAST);
+        self.draw_toggle_row(1, rows, "REDUCE MOTION", config.reduce_motion,  ID_ACC_REDUCE);
+        self.draw_toggle_row(2, rows, "SHOW HITBOXES", config.show_hitboxes,  ID_ACC_HITBOX);
+        self.draw_cycle_row (3, rows, "COLOR BLIND MODE", config.colorblind.label());
     }
 
-    fn draw_tab_controls(&self, out: &mut Vec<Vertex>) {
+    fn render_tab_controls(&mut self) {
         let lines = [
             "LEFT / RIGHT .... TURN CURSOR",
             "SHIFT ........... ABILITY (WHEN EQUIPPED)",
@@ -1578,162 +1628,286 @@ impl Menu {
             "",
             "MOUSE IS USABLE IN MENUS.",
         ];
-        let vl = self.view_left() + 0.16;
-        let top = SETTINGS_CONTENT_TOP + 0.06;
+        let view_l = self.view_left();
+        let top = self.settings_band_top() + 0.06;
+        let text = self.ui.text_mut();
         for (i, line) in lines.iter().enumerate() {
-            push_text(out, line, vl, top + i as f32 * 0.065, BODY_PX, WHITE);
+            font::push_text(text, line, view_l + 0.16, top + i as f32 * 0.065,
+                BODY_PX, WHITE);
         }
     }
 
-    /// Draw one slider row on the settings screen.
+    /// Slider hit test + drag tracking, register hover via
+    /// `track_hover`. Drawing performed by `draw_slider_row`.
+    fn tick_slider(
+        &mut self, pointer: (f32, f32), clicked: bool,
+        row: usize, rows: usize, id: WidgetId,
+        value: &mut f32, min: f32, max: f32,
+        audio: &Audio,
+    ) {
+        let (x0, x1) = self.slider_track_range();
+        let (_, y) = self.row_center(row, rows);
+
+        let t = ((*value - min) / (max - min)).clamp(0.0, 1.0);
+        let hx = x0 + (x1 - x0) * t;
+        let handle_rect = Rect::from_center(hx, y, 0.05, 0.04);
+        let handle_hit = handle_rect.contains(pointer.0, pointer.1);
+        let hovered = handle_hit || self.ui.is_dragging(id);
+        self.ui.track_hover(id, hovered);
+
+        let track_hit = pointer.0 > x0 - 0.02 && pointer.0 < x1 + 0.02
+                     && (pointer.1 - y).abs() < 0.04;
+        if clicked && (handle_hit || track_hit) {
+            audio.play_interact();
+            self.ui.set_dragging(id);
+            let nt = ((pointer.0 - x0) / (x1 - x0)).clamp(0.0, 1.0);
+            *value = min + (max - min) * nt;
+            self.ui.capture_pointer();
+            return;
+        }
+        if self.ui.is_dragging(id) && self.ui.input().left_down {
+            let nt = ((pointer.0 - x0) / (x1 - x0)).clamp(0.0, 1.0);
+            *value = min + (max - min) * nt;
+            self.ui.capture_pointer();
+        }
+    }
+
+    fn tick_toggle(
+        &mut self, pointer: (f32, f32), clicked: bool,
+        row: usize, rows: usize, id: WidgetId,
+        value: &mut bool, audio: &Audio,
+    ) {
+        let rect = self.toggle_rect(row, rows);
+        let hit = rect.contains(pointer.0, pointer.1);
+        self.ui.track_hover(id, hit);
+        if hit && clicked {
+            *value = !*value;
+            audio.play_interact();
+            self.ui.capture_pointer();
+        }
+    }
+
+    fn set_hover_arrows(
+        &mut self, pointer: (f32, f32),
+        cy: f32, id_l: WidgetId, id_r: WidgetId,
+    ) {
+        let (lx, rx) = self.arrow_positions();
+        let lr = Rect::from_center(lx, cy, 0.05, 0.04);
+        let rr = Rect::from_center(rx, cy, 0.05, 0.04);
+        self.ui.track_hover(id_l, lr.contains(pointer.0, pointer.1));
+        self.ui.track_hover(id_r, rr.contains(pointer.0, pointer.1));
+    }
+
+    fn arrow_clicked(
+        &self, pointer: (f32, f32), clicked: bool,
+        cy: f32, right: bool,
+    ) -> bool {
+        if !clicked { return false; }
+        let (lx, rx) = self.arrow_positions();
+        let ax = if right { rx } else { lx };
+        let r = Rect::from_center(ax, cy, 0.05, 0.04);
+        r.contains(pointer.0, pointer.1)
+    }
+
     fn draw_slider_row(
-        &self, out: &mut Vec<Vertex>,
+        &mut self,
         row: usize, rows: usize, label: &str,
         value: f32, min: f32, max: f32, id: WidgetId,
     ) {
         let (_, y) = self.row_center(row, rows);
-        let vl = self.view_left() + 0.08;
+        let view_l = self.view_left();
 
-        push_text(out, label, vl + 0.04,
-            y - text_height(BODY_PX) * 0.5, BODY_PX, WHITE);
+        font::push_text(self.ui.text_mut(), label,
+            view_l + 0.04,
+            y - font::text_height(BODY_PX) * 0.5, BODY_PX, WHITE);
 
         let (x0, x1) = self.slider_track_range();
-        push_quad(out, x0 - 0.006, y - 0.014, x1 + 0.006, y + 0.014, BG_DEEP);
-        push_quad(out, x0, y - 0.010, x1, y + 0.010, BG_PANEL);
+        {
+            let geom = self.ui.geom_mut();
+            push_quad(geom, x0 - 0.006, y - 0.014, x1 + 0.006, y + 0.014, BG_DEEP);
+            push_quad(geom, x0, y - 0.010, x1, y + 0.010, BG_PANEL);
+        }
 
         let t = ((value - min) / (max - min)).clamp(0.0, 1.0);
         let fx = x0 + (x1 - x0) * t;
-        push_quad(out, x0, y - 0.010, fx, y + 0.010, ACCENT);
+        push_quad(self.ui.geom_mut(),
+            x0, y - 0.010, fx, y + 0.010, ACCENT);
 
-        let h = self.hover_eased(id);
+        let pointer = self.ui.input().pointer;
+        let handle_rect = Rect::from_center(fx, y, 0.05, 0.04);
+        let handle_hit = handle_rect.contains(pointer.0, pointer.1);
+        let hovered = handle_hit || self.ui.is_dragging(id);
+        let h = self.ui.track_hover(id, hovered);
+
         let ring = mix3(ACCENT, ACCENT_HI, h);
         let r = 0.022 + 0.005 * h;
-        push_hex(out, fx, y, r, BG_DEEP);
-        push_hex_ring(out, fx, y, r, r - 0.006, ring);
-        push_hex(out, fx, y, r * 0.40, ring);
+        {
+            let geom = self.ui.geom_mut();
+            push_hex(geom, fx, y, r, BG_DEEP);
+            push_hex_ring(geom, fx, y, r, r - 0.006, ring);
+            push_hex(geom, fx, y, r * 0.40, ring);
+        }
 
-        // Value readout on the right.
         let disp = if (max - min - 1.0).abs() < 1e-3 && min == 0.0 {
             format!("{}%", (value * 100.0).round() as i32)
         } else {
             format!("{:.2}", value)
         };
-        push_text_right(out, &disp, x1 + 0.16,
-            y - text_height(BODY_PX) * 0.5, BODY_PX, ACCENT_HI);
+        font::push_text_right(self.ui.text_mut(), &disp,
+            x1 + 0.16,
+            y - font::text_height(BODY_PX) * 0.5, BODY_PX, ACCENT_HI);
     }
 
-    /// Draw one cycle row (left arrow / value / right arrow).
     fn draw_cycle_row(
-        &self, out: &mut Vec<Vertex>,
+        &mut self,
         row: usize, rows: usize, label: &str, value: &str,
-        id_l: WidgetId, id_r: WidgetId,
     ) {
         let (_, y) = self.row_center(row, rows);
-        let vl = self.view_left() + 0.08;
+        let view_l = self.view_left();
 
-        push_text(out, label, vl + 0.04,
-            y - text_height(BODY_PX) * 0.5, BODY_PX, WHITE);
+        font::push_text(self.ui.text_mut(), label,
+            view_l + 0.04,
+            y - font::text_height(BODY_PX) * 0.5, BODY_PX, WHITE);
 
         let (lx, rx) = self.arrow_positions();
-        let lh = self.hover_eased(id_l);
-        let rh = self.hover_eased(id_r);
+
+        // Hover values for cycle arrows are tracked by the
+        // per-tab tick code via set_hover_arrows; the visual
+        // animation of the arrows themselves does not need
+        // the eased value (the colour change is gated on
+        // hit-test in the per-tab code), so we draw arrows
+        // with neutral lean and just let the colour wash
+        // come from the current hover via the ui state.
+        let lh = 0.0_f32;
+        let rh = 0.0_f32;
+
         let lc = mix3(ACCENT, ACCENT_HI, lh);
         let rc = mix3(ACCENT, ACCENT_HI, rh);
-
-        push_tri(out,
-            [lx - 0.035 - 0.005 * lh, y],
-            [lx + 0.020, y - 0.024],
-            [lx + 0.020, y + 0.024], lc);
-        push_tri(out,
-            [rx + 0.035 + 0.005 * rh, y],
-            [rx - 0.020, y - 0.024],
-            [rx - 0.020, y + 0.024], rc);
+        {
+            let geom = self.ui.geom_mut();
+            push_tri(geom,
+                [lx - 0.035 - 0.005 * lh, y],
+                [lx + 0.020, y - 0.024],
+                [lx + 0.020, y + 0.024], lc);
+            push_tri(geom,
+                [rx + 0.035 + 0.005 * rh, y],
+                [rx - 0.020, y - 0.024],
+                [rx - 0.020, y + 0.024], rc);
+        }
 
         let mid = (lx + rx) * 0.5;
-        let w = text_width(value, BODY_PX);
-        push_text(out, value, mid - w * 0.5,
-            y - text_height(BODY_PX) * 0.5, BODY_PX, ACCENT_HI);
+        let w = font::text_width(value, BODY_PX);
+        font::push_text(self.ui.text_mut(), value,
+            mid - w * 0.5,
+            y - font::text_height(BODY_PX) * 0.5, BODY_PX, ACCENT_HI);
     }
 
-    /// Draw one toggle row (label + ON/OFF button).
     fn draw_toggle_row(
-        &self, out: &mut Vec<Vertex>,
+        &mut self,
         row: usize, rows: usize, label: &str,
         value: bool, id: WidgetId,
     ) {
         let (_, y) = self.row_center(row, rows);
-        let vl = self.view_left() + 0.08;
+        let view_l = self.view_left();
 
-        push_text(out, label, vl + 0.04,
-            y - text_height(BODY_PX) * 0.5, BODY_PX, WHITE);
+        font::push_text(self.ui.text_mut(), label,
+            view_l + 0.04,
+            y - font::text_height(BODY_PX) * 0.5, BODY_PX, WHITE);
 
-        let (cx, cy, hw, hh) = self.toggle_rect(row, rows);
-        let h = self.hover_eased(id);
+        let rect = self.toggle_rect(row, rows);
+        let pointer = self.ui.input().pointer;
+        let hovered = rect.contains(pointer.0, pointer.1);
+        let h = self.ui.track_hover(id, hovered);
+
         let bg = if value {
             mix3(ACCENT, ACCENT_HI, h)
         } else {
             mix3(BG_PANEL, BG_PANEL_HI, h)
         };
         let ring = mix3(ACCENT, ACCENT_HI, h);
-        let x0 = cx - hw; let x1 = cx + hw;
-        let y0 = cy - hh; let y1 = cy + hh;
-        push_quad(out, x0, y0, x1, y1, bg);
-        push_outline(out, x0, y0, x1, y1, 0.003, ring);
+        {
+            let geom = self.ui.geom_mut();
+            push_quad(geom, rect.x0, rect.y0, rect.x1, rect.y1, bg);
+            push_outline(geom, rect.x0, rect.y0, rect.x1, rect.y1, 0.003, ring);
+        }
         let text = if value { "ON" } else { "OFF" };
-        let w = text_width(text, BODY_PX);
-        push_text(out, text, cx - w * 0.5,
-            cy - text_height(BODY_PX) * 0.5, BODY_PX,
-            if value { BG_DEEP } else { WHITE });
+        let w = font::text_width(text, BODY_PX);
+        let (cx, cy) = rect.center();
+        let text_color = if value { BG_DEEP } else { WHITE };
+        font::push_text(self.ui.text_mut(), text,
+            cx - w * 0.5,
+            cy - font::text_height(BODY_PX) * 0.5,
+            BODY_PX, text_color);
     }
 
     fn draw_small_button(
-        &self, out: &mut Vec<Vertex>,
-        cx: f32, cy: f32, hw: f32, hh: f32,
-        label: &str, id: WidgetId,
+        &mut self,
+        rect: Rect,
+        label: &str, h: f32,
     ) {
-        let h = self.hover_eased(id);
+        let (cx, cy) = rect.center();
         let bg   = mix3(BG_PANEL, BG_PANEL_HI, h);
         let ring = mix3(ACCENT, ACCENT_HI, h);
-        let x0 = cx - hw; let x1 = cx + hw;
-        let y0 = cy - hh; let y1 = cy + hh;
-        push_quad(out, x0, y0, x1, y1, bg);
-        push_outline(out, x0, y0, x1, y1, 0.004 + 0.002 * h, ring);
-        let w = text_width(label, BODY_PX);
-        push_text(out, label, cx - w * 0.5, cy - text_height(BODY_PX) * 0.5, BODY_PX, WHITE);
+        {
+            let geom = self.ui.geom_mut();
+            push_quad(geom, rect.x0, rect.y0, rect.x1, rect.y1, bg);
+            push_outline(geom, rect.x0, rect.y0, rect.x1, rect.y1,
+                0.004 + 0.002 * h, ring);
+        }
+        let w = font::text_width(label, BODY_PX);
+        font::push_text(self.ui.text_mut(), label,
+            cx - w * 0.5,
+            cy - font::text_height(BODY_PX) * 0.5,
+            BODY_PX, WHITE);
     }
 
-    fn draw_music_panel(&self, out: &mut Vec<Vertex>, snap: &AudioSnapshot) {
+    // ---------- music panel ----------
+
+    fn render_music_panel(
+        &mut self, audio: &Audio, snap: &AudioSnapshot,
+    ) {
         if !snap.has_music { return; }
 
-        let left  = self.view_left();
-        let right = self.view_right();
-        let top   = self.view_top();
-        let bot   = self.panel_bot();
-        let cy    = top + PANEL_EXTENDED_HEIGHT - 0.06;
+        let view_l = self.view_left();
+        let view_r = self.view_right();
+        let view_b = self.view_bottom();
+        let top = self.view_top();
+        let bot = self.panel_bot();
+        let cy = top + PANEL_EXTENDED_HEIGHT - 0.06;
 
-        push_quad(out, left, top, right, bot, BG_PANEL);
-        push_quad(out, left, bot - 0.004, right, bot, ACCENT);
+        // Panel + accent strip.
+        {
+            let geom = self.ui.geom_mut();
+            push_quad(geom, view_l, top, view_r, bot, BG_PANEL);
+            push_quad(geom, view_l, bot - 0.004, view_r, bot, ACCENT);
+        }
 
         if self.panel_t < 0.05 { return; }
 
+        // Backdrop dim under the panel.
         let overlay_a = self.panel_t * 0.55;
-        push_quad_alpha(out, left, bot, right, self.view_bottom(),
+        push_quad_alpha(self.ui.geom_mut(),
+            view_l, bot, view_r, view_b,
             [0.0, 0.0, 0.0], overlay_a);
 
         let alpha = smoothstep(PANEL_CONTENT_LO, PANEL_CONTENT_HI, self.panel_t);
         if alpha < 0.02 { return; }
 
+        // Now playing labels.
         let (track_name, artist) = self.current_track_display_names();
-        let label_x = left + 0.04;
+        let label_x = view_l + 0.04;
         let pad_top = 0.030;
         let label_y  = top + pad_top;
-        let title_y  = label_y + text_height(SMALL_PX) + 0.008;
-        let artist_y = title_y + text_height(H2_PX) + 0.008;
+        let title_y  = label_y + font::text_height(SMALL_PX) + 0.008;
+        let artist_y = title_y + font::text_height(H2_PX) + 0.008;
+        {
+            let text = self.ui.text_mut();
+            font::push_text_alpha(text, "NOW PLAYING", label_x, label_y, SMALL_PX, DIM, alpha);
+            font::push_text_alpha(text, &track_name,   label_x, title_y, H2_PX,    WHITE, alpha);
+            font::push_text_alpha(text, &artist,       label_x, artist_y, SMALL_PX, DIM, alpha);
+        }
 
-        push_text_alpha(out, "NOW PLAYING", label_x, label_y, SMALL_PX, DIM, alpha);
-        push_text_alpha(out, &track_name,   label_x, title_y, H2_PX,    WHITE, alpha);
-        push_text_alpha(out, &artist,       label_x, artist_y, SMALL_PX, DIM, alpha);
-
+        // Transport buttons.
         let (bx0, bx1) = self.music_panel_bar_range();
         let ctrl_x0 = bx0 - 0.26;
         let pause_cx = ctrl_x0 + 0.050;
@@ -1741,62 +1915,107 @@ impl Menu {
         let btn_hw   = 0.045;
         let btn_hh   = 0.030;
 
-        let ph = self.hover_eased(ID_MUSIC_PAUSE);
+        let pointer = self.ui.input().pointer;
+        let pause_rect = Rect::from_center(pause_cx, cy, btn_hw, btn_hh);
+        let stop_rect  = Rect::from_center(stop_cx,  cy, btn_hw, btn_hh);
+        let pause_hit = pause_rect.contains(pointer.0, pointer.1);
+        let stop_hit  = stop_rect.contains(pointer.0, pointer.1);
+
+        let ph = self.ui.track_hover(ID_MUSIC_PAUSE, pause_hit);
+        let sh = self.ui.track_hover(ID_MUSIC_STOP,  stop_hit);
+
         let pring = mix3(ACCENT, ACCENT_HI, ph);
-        push_quad_alpha(out,
-            pause_cx - btn_hw, cy - btn_hh,
-            pause_cx + btn_hw, cy + btn_hh,
+        push_quad_alpha(self.ui.geom_mut(),
+            pause_rect.x0, pause_rect.y0,
+            pause_rect.x1, pause_rect.y1,
             BG_DEEP, alpha);
-        push_outline_alpha(out,
-            pause_cx - btn_hw, cy - btn_hh,
-            pause_cx + btn_hw, cy + btn_hh,
+        push_outline_alpha(self.ui.geom_mut(),
+            pause_rect.x0, pause_rect.y0,
+            pause_rect.x1, pause_rect.y1,
             0.003, pring, alpha);
         if snap.paused {
-            push_tri_alpha(out,
+            push_tri_alpha(self.ui.geom_mut(),
                 [pause_cx - 0.012, cy - 0.018],
                 [pause_cx - 0.012, cy + 0.018],
                 [pause_cx + 0.020, cy],
                 pring, alpha);
         } else {
-            push_quad_alpha(out, pause_cx - 0.020, cy - 0.018, pause_cx - 0.006, cy + 0.018, pring, alpha);
-            push_quad_alpha(out, pause_cx + 0.006, cy - 0.018, pause_cx + 0.020, cy + 0.018, pring, alpha);
+            push_quad_alpha(self.ui.geom_mut(),
+                pause_cx - 0.020, cy - 0.018,
+                pause_cx - 0.006, cy + 0.018, pring, alpha);
+            push_quad_alpha(self.ui.geom_mut(),
+                pause_cx + 0.006, cy - 0.018,
+                pause_cx + 0.020, cy + 0.018, pring, alpha);
         }
 
-        let sh = self.hover_eased(ID_MUSIC_STOP);
         let sring = mix3(ACCENT, ACCENT_HI, sh);
-        push_quad_alpha(out,
-            stop_cx - btn_hw, cy - btn_hh,
-            stop_cx + btn_hw, cy + btn_hh,
+        push_quad_alpha(self.ui.geom_mut(),
+            stop_rect.x0, stop_rect.y0,
+            stop_rect.x1, stop_rect.y1,
             BG_DEEP, alpha);
-        push_outline_alpha(out,
-            stop_cx - btn_hw, cy - btn_hh,
-            stop_cx + btn_hw, cy + btn_hh,
+        push_outline_alpha(self.ui.geom_mut(),
+            stop_rect.x0, stop_rect.y0,
+            stop_rect.x1, stop_rect.y1,
             0.003, sring, alpha);
-        push_quad_alpha(out,
+        push_quad_alpha(self.ui.geom_mut(),
             stop_cx - 0.018, cy - 0.018,
             stop_cx + 0.018, cy + 0.018,
             sring, alpha);
 
-        push_quad_alpha(out, bx0 - 0.004, cy - 0.014, bx1 + 0.004, cy + 0.014, BG_DEEP, alpha);
-        push_quad_alpha(out, bx0, cy - 0.010, bx1, cy + 0.010, BG_PANEL_HI, alpha);
+        // Progress bar + scrub handle.
+        push_quad_alpha(self.ui.geom_mut(),
+            bx0 - 0.004, cy - 0.014, bx1 + 0.004, cy + 0.014, BG_DEEP, alpha);
+        push_quad_alpha(self.ui.geom_mut(),
+            bx0, cy - 0.010, bx1, cy + 0.010, BG_PANEL_HI, alpha);
         let prog = if snap.duration > 0.0 {
             (snap.position / snap.duration).clamp(0.0, 1.0)
         } else { 0.0 };
         let fx = bx0 + (bx1 - bx0) * prog;
-        push_quad_alpha(out, bx0, cy - 0.010, fx, cy + 0.010, ACCENT, alpha);
+        push_quad_alpha(self.ui.geom_mut(),
+            bx0, cy - 0.010, fx, cy + 0.010, ACCENT, alpha);
 
-        let bh = self.hover_eased(ID_MUSIC_BAR);
+        let bar_hit = pointer.0 > bx0 - 0.01
+                   && pointer.0 < bx1 + 0.01
+                   && (pointer.1 - cy).abs() < 0.022;
+        let bh = self.ui.track_hover(ID_MUSIC_BAR, bar_hit);
         let scrub = mix3(ACCENT, ACCENT_HI, bh);
         let sr = 0.018 + 0.004 * bh;
-        push_hex_alpha(out, fx, cy, sr, BG_DEEP, alpha);
-        push_hex_ring_alpha(out, fx, cy, sr, sr - 0.006, scrub, alpha);
+        push_hex_alpha(self.ui.geom_mut(),
+            fx, cy, sr, BG_DEEP, alpha);
+        push_hex_ring_alpha(self.ui.geom_mut(),
+            fx, cy, sr, sr - 0.006, scrub, alpha);
 
+        // Time readout.
         let remaining = (snap.duration - snap.position).max(0.0);
         let t_str = format!("{} / {}   (-{})",
-            fmt_time(snap.position), fmt_time(snap.duration), fmt_time(remaining));
-        push_text_right_alpha(out, &t_str,
-            right - 0.04, cy - text_height(SMALL_PX) * 0.5,
+            fmt_time(snap.position), fmt_time(snap.duration),
+            fmt_time(remaining));
+        font::push_text_right_alpha(self.ui.text_mut(), &t_str,
+            view_r - 0.04,
+            cy - font::text_height(SMALL_PX) * 0.5,
             SMALL_PX, WHITE, alpha);
+
+        // Click handling.
+        if self.panel_t < PANEL_INPUT_THRESHOLD {
+            return;
+        }
+        let input = self.ui.input();
+        if input.left_clicked {
+            if pause_hit {
+                audio.play_interact();
+                audio.set_music_paused(!snap.paused);
+                self.ui.capture_pointer();
+            } else if stop_hit {
+                audio.play_interact();
+                audio.stop_music();
+                self.ui.capture_pointer();
+            } else if bar_hit && snap.duration > 0.0 {
+                let t = ((pointer.0 - bx0) / (bx1 - bx0)).clamp(0.0, 1.0);
+                audio.seek_music(t * snap.duration);
+                self.ui.set_dragging(ID_MUSIC_BAR);
+                self.ui.capture_pointer();
+            }
+        }
     }
 
     fn current_track_display_names(&self) -> (String, String) {
@@ -1812,7 +2031,22 @@ impl Menu {
             _ => ("MENU THEME".to_string(), "OPENGAMEART".to_string()),
         }
     }
+
+    // ---------- output ----------
+
+    pub fn build_geometry(
+        &mut self,
+        out: &mut Vec<Vertex>,
+        text_out: &mut Vec<TextVertex>,
+        _snap: &AudioSnapshot,
+        _config: &Config,
+    ) {
+        out.clear();
+        self.ui.end_frame(out, text_out);
+    }
 }
+
+// ----- helpers -----
 
 fn fmt_time(seconds: f32) -> String {
     let s = seconds.max(0.0) as u32;
@@ -1833,28 +2067,7 @@ fn row_y(i: usize, selected: u32) -> f32 {
     base + delta * ROW_SPACING
 }
 
-fn rail_right_at(y: f32) -> f32 {
-    let t = ((y - RAIL_TOP) / (MOD_SEPARATOR_Y - RAIL_TOP)).clamp(0.0, 1.0);
-    RAIL_RIGHT_TOP + (RAIL_RIGHT_BOTTOM - RAIL_RIGHT_TOP) * t
-}
-
-fn hit_rect(px: f32, py: f32, cx: f32, cy: f32, hw: f32, hh: f32) -> bool {
-    (px - cx).abs() < hw && (py - cy).abs() < hh
-}
-
-fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
-    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-fn mix3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
-    let t = t.clamp(0.0, 1.0);
-    [a[0] + (b[0] - a[0]) * t,
-     a[1] + (b[1] - a[1]) * t,
-     a[2] + (b[2] - a[2]) * t]
-}
-
-// -------- enum cycling helpers --------
+// ----- enum cycling helpers -----
 
 fn vsync_prev(v: VsyncMode) -> VsyncMode {
     match v {
@@ -1899,6 +2112,14 @@ fn colorblind_prev(m: ColorblindMode) -> ColorblindMode {
     }
 }
 
+fn custom_shaders_prev(s: CustomShaders) -> CustomShaders {
+    match s {
+        CustomShaders::Off   => CustomShaders::On,
+        CustomShaders::Audit => CustomShaders::Off,
+        CustomShaders::On    => CustomShaders::Audit,
+    }
+}
+
 const FPS_PRESETS: &[u32] = &[0, 30, 60, 75, 120, 144, 165, 240];
 
 fn fps_next(v: u32) -> u32 {
@@ -1915,28 +2136,7 @@ fn fps_label(v: u32) -> String {
     if v == 0 { "UNLIMITED".to_string() } else { format!("{}", v) }
 }
 
-// -------- low level geometry --------
-
-fn push_quad(out: &mut Vec<Vertex>, x0: f32, y0: f32, x1: f32, y1: f32, c: [f32; 3]) {
-    out.push(Vertex::opaque([x0, y0], c));
-    out.push(Vertex::opaque([x1, y0], c));
-    out.push(Vertex::opaque([x1, y1], c));
-    out.push(Vertex::opaque([x0, y0], c));
-    out.push(Vertex::opaque([x1, y1], c));
-    out.push(Vertex::opaque([x0, y1], c));
-}
-
-fn push_quad_alpha(
-    out: &mut Vec<Vertex>, x0: f32, y0: f32, x1: f32, y1: f32,
-    c: [f32; 3], a: f32,
-) {
-    out.push(Vertex::rgba([x0, y0], c, a));
-    out.push(Vertex::rgba([x1, y0], c, a));
-    out.push(Vertex::rgba([x1, y1], c, a));
-    out.push(Vertex::rgba([x0, y0], c, a));
-    out.push(Vertex::rgba([x1, y1], c, a));
-    out.push(Vertex::rgba([x0, y1], c, a));
-}
+// ----- low level geometry helpers (those not in ui::draw) -----
 
 fn push_trapezoid(
     out: &mut Vec<Vertex>,
@@ -1957,126 +2157,44 @@ fn push_slanted_edge(
     y_top: f32, y_bot: f32,
     thick: f32, c: [f32; 3],
 ) {
-    push_trapezoid(out, x_top - thick, x_bot - thick, x_top, x_bot, y_top, y_bot, c);
+    push_trapezoid(out,
+        x_top - thick, x_bot - thick,
+        x_top, x_bot,
+        y_top, y_bot, c);
 }
 
-fn push_outline(
-    out: &mut Vec<Vertex>, x0: f32, y0: f32, x1: f32, y1: f32, t: f32, c: [f32; 3],
+/// Word-wrap helper for SDF text. Splits `text` on whitespace
+/// and stacks lines that fit inside `max_w` game-space units.
+fn push_text_wrapped(
+    out: &mut Vec<TextVertex>,
+    text: &str,
+    x: f32, y: f32, max_w: f32,
+    pixel_size: f32, color: [f32; 3],
 ) {
-    push_quad(out, x0 - t, y0 - t, x1 + t, y0,     c);
-    push_quad(out, x0 - t, y1,     x1 + t, y1 + t, c);
-    push_quad(out, x0 - t, y0,     x0,     y1,     c);
-    push_quad(out, x1,     y0,     x1 + t, y1,     c);
-}
-
-fn push_outline_alpha(
-    out: &mut Vec<Vertex>, x0: f32, y0: f32, x1: f32, y1: f32,
-    t: f32, c: [f32; 3], a: f32,
-) {
-    push_quad_alpha(out, x0 - t, y0 - t, x1 + t, y0,     c, a);
-    push_quad_alpha(out, x0 - t, y1,     x1 + t, y1 + t, c, a);
-    push_quad_alpha(out, x0 - t, y0,     x0,     y1,     c, a);
-    push_quad_alpha(out, x1,     y0,     x1 + t, y1,     c, a);
-}
-
-fn push_tri(out: &mut Vec<Vertex>, a: [f32; 2], b: [f32; 2], c: [f32; 2], col: [f32; 3]) {
-    out.push(Vertex::opaque(a, col));
-    out.push(Vertex::opaque(b, col));
-    out.push(Vertex::opaque(c, col));
-}
-
-fn push_tri_alpha(
-    out: &mut Vec<Vertex>, a: [f32; 2], b: [f32; 2], c: [f32; 2],
-    col: [f32; 3], alpha: f32,
-) {
-    out.push(Vertex::rgba(a, col, alpha));
-    out.push(Vertex::rgba(b, col, alpha));
-    out.push(Vertex::rgba(c, col, alpha));
-}
-
-fn push_hex(out: &mut Vec<Vertex>, cx: f32, cy: f32, r: f32, c: [f32; 3]) {
-    push_hex_rot(out, cx, cy, r, c, 0.0);
-}
-
-fn push_hex_alpha(out: &mut Vec<Vertex>, cx: f32, cy: f32, r: f32, c: [f32; 3], a: f32) {
-    let mut v = [[0.0f32; 2]; 6];
-    for i in 0..6 {
-        let ang = i as f32 * TAU / 6.0;
-        v[i] = [cx + ang.cos() * r, cy + ang.sin() * r];
+    let line_h = font::line_height(pixel_size);
+    let mut cur = String::new();
+    let mut cur_w = 0.0f32;
+    let mut cy = 0.0f32;
+    let mut first = true;
+    for word in text.split_whitespace() {
+        let piece = if first { word.to_string() } else { format!(" {}", word) };
+        let w = font::text_width(&piece, pixel_size);
+        if cur_w + w > max_w && !first {
+            font::push_text(out, &cur, x, y + cy, pixel_size, color);
+            cur.clear();
+            cur_w = 0.0;
+            cy += line_h;
+            let ww = font::text_width(word, pixel_size);
+            cur.push_str(word);
+            cur_w += ww;
+            first = false;
+        } else {
+            cur.push_str(&piece);
+            cur_w += w;
+            first = false;
+        }
     }
-    for i in 0..6 {
-        let j = (i + 1) % 6;
-        out.push(Vertex::rgba([cx, cy], c, a));
-        out.push(Vertex::rgba(v[i],     c, a));
-        out.push(Vertex::rgba(v[j],     c, a));
+    if !cur.is_empty() {
+        font::push_text(out, &cur, x, y + cy, pixel_size, color);
     }
-}
-
-fn push_hex_rot(out: &mut Vec<Vertex>, cx: f32, cy: f32, r: f32, col: [f32; 3], ang: f32) {
-    let mut v = [[0.0f32; 2]; 6];
-    for i in 0..6 {
-        let a = ang + i as f32 * TAU / 6.0;
-        v[i] = [cx + a.cos() * r, cy + a.sin() * r];
-    }
-    for i in 0..6 {
-        let j = (i + 1) % 6;
-        out.push(Vertex::opaque([cx, cy], col));
-        out.push(Vertex::opaque(v[i],     col));
-        out.push(Vertex::opaque(v[j],     col));
-    }
-}
-
-fn push_hex_ring(out: &mut Vec<Vertex>, cx: f32, cy: f32, ro: f32, ri: f32, c: [f32; 3]) {
-    push_hex_ring_rot(out, cx, cy, ro, ri, c, 0.0);
-}
-
-fn push_hex_ring_alpha(
-    out: &mut Vec<Vertex>, cx: f32, cy: f32, ro: f32, ri: f32, c: [f32; 3], a: f32,
-) {
-    let mut o = [[0.0f32; 2]; 6];
-    let mut i2 = [[0.0f32; 2]; 6];
-    for i in 0..6 {
-        let ang = i as f32 * TAU / 6.0;
-        o [i] = [cx + ang.cos() * ro, cy + ang.sin() * ro];
-        i2[i] = [cx + ang.cos() * ri, cy + ang.sin() * ri];
-    }
-    for i in 0..6 {
-        let j = (i + 1) % 6;
-        out.push(Vertex::rgba(o [i], c, a));
-        out.push(Vertex::rgba(o [j], c, a));
-        out.push(Vertex::rgba(i2[j], c, a));
-        out.push(Vertex::rgba(o [i], c, a));
-        out.push(Vertex::rgba(i2[j], c, a));
-        out.push(Vertex::rgba(i2[i], c, a));
-    }
-}
-
-fn push_hex_ring_rot(
-    out: &mut Vec<Vertex>, cx: f32, cy: f32,
-    ro: f32, ri: f32, col: [f32; 3], ang: f32,
-) {
-    let mut o = [[0.0f32; 2]; 6];
-    let mut i2 = [[0.0f32; 2]; 6];
-    for i in 0..6 {
-        let a = ang + i as f32 * TAU / 6.0;
-        o [i] = [cx + a.cos() * ro, cy + a.sin() * ro];
-        i2[i] = [cx + a.cos() * ri, cy + a.sin() * ri];
-    }
-    for i in 0..6 {
-        let j = (i + 1) % 6;
-        out.push(Vertex::opaque(o [i], col));
-        out.push(Vertex::opaque(o [j], col));
-        out.push(Vertex::opaque(i2[j], col));
-        out.push(Vertex::opaque(o [i], col));
-        out.push(Vertex::opaque(i2[j], col));
-        out.push(Vertex::opaque(i2[i], col));
-    }
-}
-
-fn push_text_right_alpha(
-    out: &mut Vec<Vertex>, text: &str,
-    rx: f32, y: f32, pixel_size: f32, color: [f32; 3], alpha: f32,
-) {
-    let w = text_width(text, pixel_size);
-    push_text_alpha(out, text, rx - w, y, pixel_size, color, alpha);
 }

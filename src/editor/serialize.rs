@@ -11,21 +11,57 @@ use std::fmt::Write;
 
 use crate::dsl::ast::*;
 use crate::levels::difficulty::Tier;
+use crate::dsl::ast::ShaderDecl;
 
-/// Render an AST as a v2 RLF source string.
+use crate::dsl::rules::{
+    AbilityKind, AbilityRule, CursorRule, InputRule, RuleCategory,
+    RuleSet, ScoreRule, SurvivalRule, VisionRule,
+};
+
+/// Serialize an in-memory `LevelAst` back into .rlf source text.
+///
+/// Output always uses the v3 dialect (`#[use_v3]`). The v3
+/// parser is a strict superset of v2 and v1, so a v3-serialized
+/// level can be edited in tools that expect the older syntax
+/// for everything except the new `fn`, `pattern`,
+/// `trigger_stack`, and meta statements. The editor itself
+/// never emits those through this function yet; it serializes
+/// the runtime AST which only carries plain emits, triggers,
+/// waits, repeats, and rule ops.
+///
+/// The function name is kept as `serialize_v2` for API
+/// stability across the ongoing refactor. A later pass may
+/// rename it.
 pub fn serialize_v2(ast: &LevelAst) -> String {
     let mut s = String::new();
-    s.push_str("#[use_v2]\n");
+    s.push_str("#[use_v3]\n");
 
-    // Optional timestamp directive.
+    // Persist timestamp format as a directive so the file
+    // round trips through parse → serialize without drift.
+    // TrackLength is especially important: the editor defaults
+    // new drafts to it so authors work in real seconds, and
+    // losing that on save would silently turn every `at` into
+    // a 0..1 fraction on next load.
     match &ast.timestamp_format {
         TimestampFormat::Relative => {}
         TimestampFormat::TrackLength =>
             s.push_str("#[timestamp_format_use_tracklength]\n"),
         TimestampFormat::Beats { total } =>
-            writeln!(s, "#[timestamp_format_use_beats count={}]", total).unwrap(),
+            writeln!(s, "#[timestamp_format_use_beats count = {}]", total).unwrap(),
         TimestampFormat::Named(name) =>
             writeln!(s, "#[timestamp_format_use_{}]", name).unwrap(),
+    }
+
+    // `#[startfrom]` debug helper. Only emitted when non-zero
+    // so clean files stay clean on re-save.
+    if ast.start_from_seconds > 0.0 {
+        writeln!(s, "#[startfrom = {:.3}]", ast.start_from_seconds).unwrap();
+    }
+
+    // Debug directive. Only emitted when the author
+    // actually set it, so clean levels stay clean.
+    if ast.ignore_collisions {
+        s.push_str("#[ignore_collisions]\n");
     }
     s.push('\n');
 
@@ -65,7 +101,19 @@ pub fn serialize_v2(ast: &LevelAst) -> String {
     s.push_str("    generation do\n");
     let g = &ast.generation;
     writeln!(s, "        sides   = {}",     g.sides).unwrap();
-    writeln!(s, "        seed    = {}",     g.seed).unwrap();
+    // Seed is serialized in hex on round trip. Two reasons:
+    //
+    // 1. Hex matches the hand authored style of the stock
+    //    levels, which use forms like `seed = 0x5EED1234`.
+    //    Losing that on save and reload would break `git diff`
+    //    style authoring workflows for no good reason.
+    // 2. The parser stores literals as f32 and f32 cannot
+    //    exactly represent u32 values above 2^24. Writing the
+    //    seed as decimal forces a lossy conversion on every
+    //    save. Writing it as hex keeps the textual form stable
+    //    even when the underlying numeric value is off by a
+    //    few low bits.
+    writeln!(s, "        seed    = 0x{:08X}", g.seed).unwrap();
     writeln!(s, "        speed   = {:.3}",  g.speed_mult).unwrap();
     writeln!(s, "        density = {:.3}",  g.density_mult).unwrap();
     if g.hue_speed.abs() > 1e-4 {
@@ -83,15 +131,25 @@ pub fn serialize_v2(ast: &LevelAst) -> String {
     // ---- sections ----
     for sec in &ast.sections {
         writeln!(s, "    section \"{}\" at {:.3} do", esc(&sec.name), sec.at).unwrap();
-        for stmt in &sec.body { write_stmt(&mut s, stmt, 8); }
+        for stmt in &sec.body { write_stmt(&mut s, stmt, 8, &ast.shaders); }
         s.push_str("    end\n\n");
+    }
+
+    // ---- shaders ----
+    if !ast.shaders.is_empty() {
+        for sh in &ast.shaders {
+            writeln!(s, "    shader :{} = ~p\"{}\"",
+                sh.name, esc(&sh.path)).unwrap();
+        }
+        s.push('\n');
     }
 
     s.push_str("end\n");
     s
 }
 
-fn write_stmt(s: &mut String, st: &Stmt, indent: usize) {
+fn write_stmt(s: &mut String, st: &Stmt, indent: usize,
+              shaders: &[ShaderDecl]) {
     let pad = " ".repeat(indent);
     match st {
         Stmt::Wait(n) => writeln!(s, "{}wait {}", pad, n).unwrap(),
@@ -102,18 +160,32 @@ fn write_stmt(s: &mut String, st: &Stmt, indent: usize) {
         }
         Stmt::Trigger(t) => {
             write!(s, "{}trigger ", pad).unwrap();
-            write_trigger(s, t);
+            write_trigger(s, t, shaders);
             s.push('\n');
         }
         Stmt::Repeat { count, body } => {
             writeln!(s, "{}repeat {} do", pad, count).unwrap();
-            for inner in body { write_stmt(s, inner, indent + 4); }
+            for inner in body { write_stmt(s, inner, indent + 4, shaders); }
             writeln!(s, "{}end", pad).unwrap();
         }
         Stmt::LocalVars(decls) => {
             writeln!(s, "{}local do", pad).unwrap();
             for v in decls { write_var(s, v, indent + 4); }
             writeln!(s, "{}end", pad).unwrap();
+        }
+        Stmt::Rule(rs) => {
+            write!(s, "{}rule ", pad).unwrap();
+            write_rule_set(s, rs);
+            s.push('\n');
+        }
+        Stmt::Revert(cat) => {
+            writeln!(s, "{}revert {}", pad, category_keyword(cat)).unwrap();
+        }
+        Stmt::Push(cat) => {
+            writeln!(s, "{}push {}", pad, category_keyword(cat)).unwrap();
+        }
+        Stmt::Pop(cat) => {
+            writeln!(s, "{}pop {}", pad, category_keyword(cat)).unwrap();
         }
     }
 }
@@ -194,16 +266,68 @@ fn write_obstacle(s: &mut String, spec: &ObstacleSpec) {
     }
 }
 
-fn write_trigger(s: &mut String, t: &TriggerSpec) {
+/// Serialize one trigger to its .rlf textual form.
+///
+/// Every trigger emits its authored parameters, including the
+/// new `duration` field on `Tilt` / `SpeedMult` / `HueShift`.
+/// `SpeedWarp` emits only the axes that are `Some`, so a
+/// round-trip through parse → edit → serialize never invents
+/// axis overrides the author did not write.
+fn write_trigger(s: &mut String, t: &TriggerSpec, shaders: &[ShaderDecl]) {
     match t {
         TriggerSpec::Flip  => write!(s, ":flip").unwrap(),
         TriggerSpec::Pulse => write!(s, ":pulse").unwrap(),
-        TriggerSpec::Tilt(d) => write!(s, ":tilt {{ angle = {:.3} }}", d).unwrap(),
-        TriggerSpec::SpeedMult(m) => write!(s, ":speedMult {{ factor = {:.3} }}", m).unwrap(),
-        TriggerSpec::HueShift(r)  => write!(s, ":hueShift {{ rate = {:.3} }}", r).unwrap(),
-        TriggerSpec::SpeedWarp { walls, rotation, cursor, music_scale, duration } =>
-            write!(s, ":speedwarp {{ walls = {:.3}, rotation = {:.3}, cursor = {:.3}, music = {:.3}, duration = {:.3} }}",
-                walls, rotation, cursor, music_scale, duration).unwrap(),
+        TriggerSpec::Tilt { angle, pitch, yaw, duration } => {
+            // Serialize every field the author set, omitting
+            // axes left at zero so round-tripped files stay
+            // visually close to the source. `angle` is always
+            // emitted to keep the trigger block non-empty even
+            // when only pitch/yaw were authored, which makes
+            // the output unambiguous.
+            let mut parts: Vec<String> = Vec::new();
+            parts.push(format!(" angle = {:.3}", angle));
+            if pitch.abs() > 1e-4 {
+                parts.push(format!(" pitch = {:.3}", pitch));
+            }
+            if yaw.abs() > 1e-4 {
+                parts.push(format!(" yaw = {:.3}", yaw));
+            }
+            if let Some(d) = duration {
+                parts.push(format!(" duration = {:.3}", d));
+            }
+            write!(s, ":tilt {{").unwrap();
+            s.push_str(&parts.join(","));
+            s.push_str(" }");
+        }
+        TriggerSpec::SpeedMult { factor, duration } =>
+            write!(s, ":speedMult {{ factor = {:.3}, duration = {:.3} }}",
+                factor, duration).unwrap(),
+        TriggerSpec::HueShift { rate, duration } =>
+            write!(s, ":hueShift {{ rate = {:.3}, duration = {:.3} }}",
+                rate, duration).unwrap(),
+        TriggerSpec::SpeedWarp { walls, rotation, cursor, music_scale, duration } => {
+            // Omit absent axes so round trip matches source.
+            // Always emit `duration` since it has no sensible
+            // "absent" form; the parser gives it a default but
+            // the editor always carries a concrete value.
+            write!(s, ":speedwarp {{").unwrap();
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(v) = walls {
+                parts.push(format!(" walls = {:.3}", v));
+            }
+            if let Some(v) = rotation {
+                parts.push(format!(" rotation = {:.3}", v));
+            }
+            if let Some(v) = cursor {
+                parts.push(format!(" cursor = {:.3}", v));
+            }
+            if let Some(v) = music_scale {
+                parts.push(format!(" music = {:.3}", v));
+            }
+            parts.push(format!(" duration = {:.3}", duration));
+            s.push_str(&parts.join(","));
+            s.push_str(" }");
+        }
         TriggerSpec::Glitch { strength, duration } =>
             write!(s, ":glitch {{ strength = {:.3}, duration = {:.3} }}",
                 strength, duration).unwrap(),
@@ -218,6 +342,55 @@ fn write_trigger(s: &mut String, t: &TriggerSpec) {
         TriggerSpec::Strobe { rate, duration } =>
             write!(s, ":strobe {{ rate = {:.3}, duration = {:.3} }}",
                 rate, duration).unwrap(),
+        TriggerSpec::Spin { rate, duration } =>
+            write!(s, ":spin {{ rate = {:.3}, duration = {:.3} }}",
+                rate, duration).unwrap(),
+        TriggerSpec::Bounce { amplitude, duration } =>
+            write!(s, ":bounce {{ amplitude = {:.3}, duration = {:.3} }}",
+                amplitude, duration).unwrap(),
+        TriggerSpec::Freeze { duration } =>
+            write!(s, ":freeze {{ duration = {:.3} }}", duration).unwrap(),
+        TriggerSpec::ZoomPunch { strength, duration } =>
+            write!(s, ":zoom_punch {{ strength = {:.3}, duration = {:.3} }}",
+                strength, duration).unwrap(),
+        TriggerSpec::InvertColors { duration } =>
+            write!(s, ":invert_colors {{ duration = {:.3} }}", duration).unwrap(),
+        TriggerSpec::Grayscale { strength, duration } =>
+            write!(s, ":grayscale {{ strength = {:.3}, duration = {:.3} }}",
+                strength, duration).unwrap(),
+        TriggerSpec::Shockwave { strength, duration } =>
+            write!(s, ":shockwave {{ strength = {:.3}, duration = {:.3} }}",
+                strength, duration).unwrap(),
+        TriggerSpec::Fog { near, far, duration } =>
+            write!(s, ":fog {{ near = {:.3}, far = {:.3}, duration = {:.3} }}",
+                near, far, duration).unwrap(),
+        TriggerSpec::Outline { thickness, duration } =>
+            write!(s, ":outline {{ thickness = {:.3}, duration = {:.3} }}",
+                thickness, duration).unwrap(),
+        TriggerSpec::Centerburst { strength, duration } =>
+            write!(s, ":centerburst {{ strength = {:.3}, duration = {:.3} }}",
+                strength, duration).unwrap(),
+        TriggerSpec::Ringburst { count, duration } =>
+            write!(s, ":ringburst {{ count = {}, duration = {:.3} }}",
+                count, duration).unwrap(),
+        TriggerSpec::Bassdrop { strength, duration } =>
+            write!(s, ":bassdrop {{ strength = {:.3}, duration = {:.3} }}",
+                strength, duration).unwrap(),
+        TriggerSpec::PostShader { slot, p } => {
+            let name = shaders.get(*slot as usize)
+                .map(|s| s.name.as_str())
+                .unwrap_or("UNKNOWN");
+            write!(s,
+                ":post_shader {{ shader = :{}, \
+                 p0 = {:.3}, p1 = {:.3}, p2 = {:.3}, p3 = {:.3} }}",
+                name, p[0], p[1], p[2], p[3]).unwrap();
+        }
+        TriggerSpec::PostShaderOff => {
+            write!(s, ":post_shader_off").unwrap();
+        }
+        TriggerSpec::Morph { sides, duration } =>
+            write!(s, ":morph {{ sides = {}, duration = {:.3} }}",
+                sides, duration).unwrap(),
     }
 }
 
@@ -255,4 +428,135 @@ fn tier_kw(t: Tier) -> String {
 
 fn esc(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// DSL keyword form of a rule category. Matches the identifier
+/// the v3 parser accepts after `rule`, `revert`, `push`, `pop`.
+fn category_keyword(cat: &RuleCategory) -> &'static str {
+    match cat {
+        RuleCategory::Ability  => "ability",
+        RuleCategory::Vision   => "vision",
+        RuleCategory::Cursor   => "cursor",
+        RuleCategory::Survival => "survival",
+        RuleCategory::Input    => "input",
+        RuleCategory::Score    => "score",
+        RuleCategory::All      => "all",
+    }
+}
+
+/// Serialize a `RuleSet` as `<category> { field = value, ... }`.
+/// Only fields that are `Some` in the source are emitted, which
+/// lets a partial override round trip through the editor without
+/// silently filling in defaults an author never asked for.
+fn write_rule_set(s: &mut String, rs: &RuleSet) {
+    match rs {
+        RuleSet::Ability(r) => {
+            write!(s, "ability {{").unwrap();
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(k) = r.kind {
+                parts.push(format!(" kind = :{}", k.to_atom()));
+            }
+            if let Some(v) = r.charges  { parts.push(format!(" charges = {}", v)); }
+            if let Some(v) = r.recharge { parts.push(format!(" recharge = {:.3}", v)); }
+            if let Some(v) = r.invuln   { parts.push(format!(" invuln = {:.3}", v)); }
+            if let Some(v) = r.cooldown { parts.push(format!(" cooldown = {:.3}", v)); }
+            if let Some(v) = r.slots_per_dash {
+                parts.push(format!(" slots_per_dash = {}", v));
+            }
+            if let Some(v) = r.slowmo_factor {
+                parts.push(format!(" slowmo_factor = {:.3}", v));
+            }
+            if let Some(v) = r.slowmo_cap {
+                parts.push(format!(" slowmo_cap = {:.3}", v));
+            }
+            if let Some(v) = r.slowmo_recover {
+                parts.push(format!(" slowmo_recover = {:.3}", v));
+            }
+            s.push_str(&parts.join(","));
+            s.push_str(" }");
+        }
+        RuleSet::Vision(r) => {
+            write!(s, "vision {{").unwrap();
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(v) = r.range    { parts.push(format!(" range = {:.3}", v)); }
+            if let Some(v) = r.fog_near { parts.push(format!(" fog_near = {:.3}", v)); }
+            if let Some(v) = r.fog_far  { parts.push(format!(" fog_far = {:.3}", v)); }
+            if let Some(v) = r.strobe   { parts.push(format!(" strobe = {}", v)); }
+            if let Some(v) = r.strobe_rate {
+                parts.push(format!(" strobe_rate = {:.3}", v));
+            }
+            if let Some(v) = r.blind_duration {
+                parts.push(format!(" blind_duration = {:.3}", v));
+            }
+            if let Some(v) = r.blind_frequency {
+                parts.push(format!(" blind_frequency = {:.3}", v));
+            }
+            if let Some(v) = r.hide_camera_indicator {
+                parts.push(format!(" hide_camera_indicator = {}", v));
+            }
+            s.push_str(&parts.join(","));
+            s.push_str(" }");
+        }
+        RuleSet::Cursor(r) => {
+            write!(s, "cursor {{").unwrap();
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(v) = r.speed_mult {
+                parts.push(format!(" speed_mult = {:.3}", v));
+            }
+            if let Some(v) = r.width_mult {
+                parts.push(format!(" width_mult = {:.3}", v));
+            }
+            if let Some(v) = r.count { parts.push(format!(" count = {}", v)); }
+            if let Some(v) = r.angular_offset {
+                parts.push(format!(" angular_offset = {:.3}", v));
+            }
+            if let Some(v) = r.centripetal_drift {
+                parts.push(format!(" centripetal_drift = {:.3}", v));
+            }
+            s.push_str(&parts.join(","));
+            s.push_str(" }");
+        }
+        RuleSet::Survival(r) => {
+            write!(s, "survival {{").unwrap();
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(v) = r.lives { parts.push(format!(" lives = {}", v)); }
+            if let Some(v) = r.soft_death { parts.push(format!(" soft_death = {}", v)); }
+            if let Some(v) = r.pushback_seconds {
+                parts.push(format!(" pushback_seconds = {:.3}", v));
+            }
+            if let Some(v) = r.invuln_after_hit {
+                parts.push(format!(" invuln_after_hit = {:.3}", v));
+            }
+            if let Some(v) = r.checkpoints_enabled {
+                parts.push(format!(" checkpoints_enabled = {}", v));
+            }
+            s.push_str(&parts.join(","));
+            s.push_str(" }");
+        }
+        RuleSet::Input(r) => {
+            write!(s, "input {{").unwrap();
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(v) = r.delay_ms { parts.push(format!(" delay_ms = {}", v)); }
+            if let Some(v) = r.discrete { parts.push(format!(" discrete = {}", v)); }
+            if let Some(v) = r.noise    { parts.push(format!(" noise = {:.3}", v)); }
+            if let Some(v) = r.inverted { parts.push(format!(" inverted = {}", v)); }
+            s.push_str(&parts.join(","));
+            s.push_str(" }");
+        }
+        RuleSet::Score(r) => {
+            write!(s, "score {{").unwrap();
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(v) = r.multiplier {
+                parts.push(format!(" multiplier = {:.3}", v));
+            }
+            if let Some(v) = r.close_call_bonus {
+                parts.push(format!(" close_call_bonus = {}", v));
+            }
+            if let Some(v) = r.survival_per_second {
+                parts.push(format!(" survival_per_second = {}", v));
+            }
+            s.push_str(&parts.join(","));
+            s.push_str(" }");
+        }
+    }
 }
